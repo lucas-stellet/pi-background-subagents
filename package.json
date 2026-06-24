@@ -1,0 +1,31 @@
+{
+  "name": "pi-background-subagents",
+  "version": "0.1.0",
+  "description": "A Pi extension that runs subagents in the background and notifies the parent agent when results are ready.",
+  "type": "module",
+  "main": "index.ts",
+  "files": [
+    "index.ts",
+    "agents.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "subagents",
+    "background-agents"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "license": "MIT"
+}
