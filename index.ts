@@ -57,7 +57,7 @@ interface JobMetadata {
 	pid?: number;
 	provider?: string;
 	model?: string;
-	modelSource?: "agent" | "runtime" | "unknown";
+	modelSource?: "parent" | "agent" | "settings" | "runtime" | "unknown";
 	agentFilePath: string;
 	usage: UsageStats;
 	lastUpdate?: number;
@@ -106,6 +106,18 @@ function getSessionId(ctx: ExtensionContext): string {
 
 function getBaseDir(sessionId: string): string {
 	return path.join(os.tmpdir(), JOBS_ROOT_NAME, sessionId);
+}
+
+function findNearestProjectSettingsPath(cwd: string): string | null {
+	let currentDir = cwd;
+	while (true) {
+		const candidate = path.join(currentDir, CONFIG_DIR_NAME, "settings.json");
+		if (fs.existsSync(candidate)) return candidate;
+
+		const parentDir = path.dirname(currentDir);
+		if (parentDir === currentDir) return null;
+		currentDir = parentDir;
+	}
 }
 
 function statusPath(jobDir: string): string {
@@ -220,6 +232,43 @@ function inferProvider(model: string | undefined): string | undefined {
 	if (normalized.includes("gpt") || normalized.includes("o3") || normalized.includes("o4")) return "openai";
 	if (normalized.includes("gemini")) return "google";
 	return undefined;
+}
+
+function modelPattern(provider: string | undefined, model: string | undefined): string | undefined {
+	if (!model) return undefined;
+	if (model.includes("/")) return model;
+	return provider ? `${provider}/${model}` : model;
+}
+
+function currentContextModel(ctx: ExtensionContext): string | undefined {
+	const model = ctx.model;
+	if (!model) return undefined;
+	return modelPattern(model.provider, model.id);
+}
+
+function settingsDefaultModel(ctx: ExtensionContext): string | undefined {
+	const globalSettingsPath = path.join(getAgentDir(), "settings.json");
+	const settings: Array<Record<string, any>> = [];
+	const globalSettings = readJson<Record<string, any>>(globalSettingsPath);
+	if (globalSettings) settings.push(globalSettings);
+
+	if (ctx.isProjectTrusted()) {
+		const projectSettingsPath = findNearestProjectSettingsPath(ctx.cwd);
+		const projectSettings = projectSettingsPath ? readJson<Record<string, any>>(projectSettingsPath) : null;
+		if (projectSettings) settings.push(projectSettings);
+	}
+
+	const merged = Object.assign({}, ...settings);
+	return modelPattern(merged.defaultProvider, merged.defaultModel);
+}
+
+function resolveInitialModel(ctx: ExtensionContext, agent: AgentConfig): { model?: string; provider?: string; source: JobMetadata["modelSource"] } {
+	const parentModel = currentContextModel(ctx);
+	if (parentModel) return { model: parentModel, provider: inferProvider(parentModel), source: "parent" };
+	if (agent.model) return { model: agent.model, provider: inferProvider(agent.model), source: "agent" };
+	const settingsModel = settingsDefaultModel(ctx);
+	if (settingsModel) return { model: settingsModel, provider: inferProvider(settingsModel), source: "settings" };
+	return { source: "unknown" };
 }
 
 function modelLabel(job: Pick<JobMetadata, "provider" | "model">): string {
@@ -387,6 +436,7 @@ async function startJob(
 	await fs.promises.mkdir(jobDir, { recursive: true });
 
 	const now = Date.now();
+	const initialModel = resolveInitialModel(ctx, agent);
 	const job: JobMetadata = {
 		id: jobId,
 		sessionId,
@@ -398,9 +448,9 @@ async function startJob(
 		status: "running",
 		startedAt: new Date(now).toISOString(),
 		exitCode: null,
-		provider: inferProvider(agent.model),
-		model: agent.model,
-		modelSource: agent.model ? "agent" : "unknown",
+		provider: initialModel.provider,
+		model: initialModel.model,
+		modelSource: initialModel.source,
 		agentFilePath: agent.filePath,
 		usage: emptyUsage(),
 		lastUpdate: now,
@@ -413,7 +463,7 @@ async function startJob(
 	await writeJson(statusPath(jobDir), job);
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
-	if (agent.model) args.push("--model", agent.model);
+	if (initialModel.model) args.push("--model", initialModel.model);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 
 	const promptPath = await writePromptToTempFile(jobDir, agent.name, agent.systemPrompt);
