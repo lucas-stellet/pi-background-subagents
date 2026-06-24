@@ -41,6 +41,7 @@ Implemented:
 - Shows a compact async status widget inspired by `nicobailon/pi-subagents`.
 - Shows provider/model metadata in start, status, list, finish, and widget output when available.
 - Keeps artifact paths in tool `details` by default; pass `verbose: true` to include debug paths in list/status text.
+- Refreshes the async status widget every second while jobs are active so spinner, duration, and activity age stay current between subprocess events.
 - Uses status vocabulary compatible with that representation:
   - `queued`
   - `running`

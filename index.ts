@@ -86,6 +86,7 @@ const runningJobs = new Map<string, ChildProcessWithoutNullStreams>();
 const cancelledJobs = new Set<string>();
 const liveJobs = new Map<string, JobMetadata>();
 let lastUiContext: ExtensionContext | null = null;
+let widgetRefreshTimer: ReturnType<typeof setInterval> | null = null;
 
 function emptyUsage(): UsageStats {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
@@ -319,13 +320,39 @@ function formatJobList(jobs: JobMetadata[], heading = "Active async runs", verbo
 	return lines.join("\n").trimEnd();
 }
 
-function renderAsyncWidget(ctx: ExtensionContext | null = lastUiContext): void {
+function activeWidgetJobs(): JobMetadata[] {
+	return Array.from(liveJobs.values()).filter((job) => job.status === "queued" || job.status === "running" || job.status === "paused" || job.status === "failed");
+}
+
+function ensureWidgetRefreshTimer(ctx: ExtensionContext | null = lastUiContext): void {
 	if (!ctx?.hasUI) return;
-	const jobs = Array.from(liveJobs.values()).filter((job) => job.status === "queued" || job.status === "running" || job.status === "paused" || job.status === "failed");
-	if (jobs.length === 0) {
-		try { ctx.ui.setWidget(WIDGET_KEY, undefined); } catch { /* ignore stale UI */ }
+	if (activeWidgetJobs().length === 0) {
+		stopWidgetRefreshTimer();
 		return;
 	}
+	if (widgetRefreshTimer) return;
+	widgetRefreshTimer = setInterval(() => {
+		renderAsyncWidget();
+		if (activeWidgetJobs().length === 0) stopWidgetRefreshTimer();
+	}, 1000);
+	widgetRefreshTimer.unref?.();
+}
+
+function stopWidgetRefreshTimer(): void {
+	if (!widgetRefreshTimer) return;
+	clearInterval(widgetRefreshTimer);
+	widgetRefreshTimer = null;
+}
+
+function renderAsyncWidget(ctx: ExtensionContext | null = lastUiContext): void {
+	if (!ctx?.hasUI) return;
+	const jobs = activeWidgetJobs();
+	if (jobs.length === 0) {
+		try { ctx.ui.setWidget(WIDGET_KEY, undefined); } catch { /* ignore stale UI */ }
+		stopWidgetRefreshTimer();
+		return;
+	}
+	ensureWidgetRefreshTimer(ctx);
 	const now = Date.now();
 	const running = jobs.filter((job) => job.status === "running").length;
 	const queued = jobs.filter((job) => job.status === "queued").length;
@@ -500,6 +527,7 @@ async function startJob(
 		await writeJson(statusPath(jobDir), job);
 		if (job.status === "complete") liveJobs.delete(jobId);
 		renderAsyncWidget();
+		if (activeWidgetJobs().length === 0) stopWidgetRefreshTimer();
 
 		const preview = finalOutput.length > RESULT_PREVIEW_CHARS ? `${finalOutput.slice(0, RESULT_PREVIEW_CHARS)}\n\n[truncated preview]` : finalOutput;
 		try {
@@ -563,6 +591,7 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", () => {
+		stopWidgetRefreshTimer();
 		lastUiContext = null;
 	});
 
