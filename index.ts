@@ -55,7 +55,9 @@ interface JobMetadata {
 	finishedAt?: string;
 	exitCode?: number | null;
 	pid?: number;
+	provider?: string;
 	model?: string;
+	modelSource?: "agent" | "runtime" | "unknown";
 	agentFilePath: string;
 	usage: UsageStats;
 	lastUpdate?: number;
@@ -174,7 +176,11 @@ function updateUsageFromMessage(job: JobMetadata, message: Message): void {
 		job.usage.cost += usage.cost?.total || 0;
 		job.usage.contextTokens = usage.totalTokens || 0;
 	}
-	if (!job.model && message.model) job.model = message.model;
+	if (message.model) {
+		job.model = message.model;
+		job.provider = inferProvider(message.model) ?? job.provider;
+		job.modelSource = "runtime";
+	}
 	if (message.stopReason) job.stopReason = message.stopReason;
 	if (message.errorMessage) job.errorMessage = message.errorMessage;
 }
@@ -204,6 +210,36 @@ function formatTokens(count: number): string {
 	return `${Math.round(count / 1000)}k`;
 }
 
+function inferProvider(model: string | undefined): string | undefined {
+	if (!model) return undefined;
+	const [provider] = model.split("/", 1);
+	if (provider && provider !== model) return provider;
+	const normalized = model.toLowerCase();
+	if (normalized.includes("claude")) return "anthropic";
+	if (normalized.includes("gpt") || normalized.includes("o3") || normalized.includes("o4")) return "openai";
+	if (normalized.includes("gemini")) return "google";
+	return undefined;
+}
+
+function modelLabel(job: Pick<JobMetadata, "provider" | "model">): string {
+	if (job.model) return job.provider && !job.model.startsWith(`${job.provider}/`) ? `${job.provider}/${job.model}` : job.model;
+	return job.provider ?? "model unknown";
+}
+
+function modelDetail(job: Pick<JobMetadata, "model" | "modelSource">): string {
+	if (!job.model) return "unknown";
+	return `${job.model}${job.modelSource && job.modelSource !== "unknown" ? ` (${job.modelSource})` : ""}`;
+}
+
+function compactJobLine(job: JobMetadata, now = Date.now()): string {
+	const parts = [job.agent, job.status, modelLabel(job), formatDuration(Math.max(0, now - Date.parse(job.startedAt)))];
+	const tokens = job.usage.input + job.usage.output;
+	if (tokens > 0) parts.push(`${formatTokens(tokens)} tok`);
+	if (job.turnCount !== undefined) parts.push(`${job.turnCount} turns`);
+	if (job.toolCount !== undefined) parts.push(`${job.toolCount} tools`);
+	return parts.join(" · ");
+}
+
 function formatActivityLabel(lastActivityAt: number | undefined, now = Date.now()): string | undefined {
 	if (lastActivityAt === undefined) return undefined;
 	const age = Math.max(0, now - lastActivityAt);
@@ -229,8 +265,6 @@ function widgetActivity(job: JobMetadata, now = Date.now()): string {
 	const facts: string[] = [];
 	if (job.currentTool && job.currentToolStartedAt !== undefined) facts.push(`${job.currentTool} ${formatDuration(Math.max(0, now - job.currentToolStartedAt))}`);
 	else if (job.currentTool) facts.push(job.currentTool);
-	if (job.turnCount !== undefined) facts.push(`${job.turnCount} turns`);
-	if (job.toolCount !== undefined) facts.push(`${job.toolCount} tools`);
 	const activity = formatActivityLabel(job.lastActivityAt, now);
 	if (activity && facts.length) return `${activity} · ${facts.join(" · ")}`;
 	if (activity) return activity;
@@ -243,44 +277,44 @@ function widgetActivity(job: JobMetadata, now = Date.now()): string {
 }
 
 function widgetStats(job: JobMetadata, now = Date.now()): string {
-	const parts: string[] = [];
-	if (job.toolCount !== undefined) parts.push(`${job.toolCount} tool use${job.toolCount === 1 ? "" : "s"}`);
+	const parts: string[] = [modelLabel(job), formatDuration(Math.max(0, now - Date.parse(job.startedAt)))];
 	const totalTokens = job.usage.input + job.usage.output;
-	if (totalTokens > 0) parts.push(`${formatTokens(totalTokens)} token`);
-	parts.push(formatDuration(Math.max(0, now - Date.parse(job.startedAt))));
+	if (totalTokens > 0) parts.push(`${formatTokens(totalTokens)} tok`);
+	if (job.turnCount !== undefined) parts.push(`${job.turnCount} turns`);
 	return parts.join(" · ");
 }
 
-function formatJobProgress(job: JobMetadata): string {
-	return job.status === "running" ? "step 1/1" : "steps 1";
-}
-
-function formatJobStatusText(job: JobMetadata): string {
+function formatJobStatusText(job: JobMetadata, verbose = false): string {
 	const lines = [
-		`Run: ${job.id}`,
-		`State: ${job.status}`,
+		compactJobLine(job),
+		`Job: ${job.id}`,
+		`Provider: ${job.provider ?? "unknown"}`,
+		`Model: ${modelDetail(job)}`,
 		job.lastActivityAt && job.status === "running" ? `Activity: ${formatActivityLabel(job.lastActivityAt)}` : undefined,
-		"Mode: single",
-		`Progress: ${formatJobProgress(job)}`,
-		`Started: ${job.startedAt}`,
-		`Updated: ${job.lastUpdate ? new Date(job.lastUpdate).toISOString() : "n/a"}`,
-		`Dir: ${job.jobDir}`,
-		`Output: ${path.join(job.jobDir, "result.md")}`,
-		`Step 1: ${job.agent} ${job.status}${job.model ? ` (${job.model})` : ""}${job.errorMessage ? `, error: ${job.errorMessage}` : ""}`,
-		`Log: ${path.join(job.jobDir, "stderr.log")}`,
-		`Events: ${path.join(job.jobDir, "stdout.jsonl")}`,
+		job.currentTool ? `Current tool: ${job.currentTool}` : undefined,
+		job.errorMessage ? `Error: ${job.errorMessage}` : undefined,
 	];
+	if (verbose) {
+		lines.push(
+			`Started: ${job.startedAt}`,
+			`Updated: ${job.lastUpdate ? new Date(job.lastUpdate).toISOString() : "n/a"}`,
+			`Dir: ${job.jobDir}`,
+			`Output: ${path.join(job.jobDir, "result.md")}`,
+			`Log: ${path.join(job.jobDir, "stderr.log")}`,
+			`Events: ${path.join(job.jobDir, "stdout.jsonl")}`,
+		);
+	}
 	return lines.filter((line): line is string => Boolean(line)).join("\n");
 }
 
-function formatJobList(jobs: JobMetadata[], heading = "Active async runs"): string {
+function formatJobList(jobs: JobMetadata[], heading = "Active async runs", verbose = false): string {
 	if (jobs.length === 0) return `No ${heading.toLowerCase()}.`;
 	const lines = [`${heading}: ${jobs.length}`, ""];
 	for (const job of jobs) {
-		lines.push(`- ${job.id} | ${job.status} | single | ${formatJobProgress(job)} | ${job.cwd}`);
-		lines.push(`  1. ${job.agent} | ${job.status}${job.lastActivityAt ? ` | ${formatActivityLabel(job.lastActivityAt)}` : ""}${job.model ? ` | ${job.model}` : ""}`);
-		lines.push(`  output: ${path.join(job.jobDir, "result.md")}`);
-		lines.push("");
+		lines.push(`- ${compactJobLine(job)}`);
+		lines.push(`  Job: ${job.id}`);
+		if (job.lastActivityAt) lines.push(`  Activity: ${formatActivityLabel(job.lastActivityAt)}`);
+		if (verbose) lines.push(`  Output: ${path.join(job.jobDir, "result.md")}`);
 	}
 	return lines.join("\n").trimEnd();
 }
@@ -337,7 +371,9 @@ async function startJob(
 		status: "running",
 		startedAt: new Date(now).toISOString(),
 		exitCode: null,
+		provider: inferProvider(agent.model),
 		model: agent.model,
+		modelSource: agent.model ? "agent" : "unknown",
 		agentFilePath: agent.filePath,
 		usage: emptyUsage(),
 		lastUpdate: now,
@@ -467,21 +503,22 @@ async function startJob(
 
 		const preview = finalOutput.length > RESULT_PREVIEW_CHARS ? `${finalOutput.slice(0, RESULT_PREVIEW_CHARS)}\n\n[truncated preview]` : finalOutput;
 		try {
+			const elapsed = job.finishedAt ? Date.parse(job.finishedAt) - Date.parse(job.startedAt) : 0;
+			const totalTokens = job.usage.input + job.usage.output;
 			pi.sendUserMessage(
 				[
-					"Background subagent finished. Validate its result before continuing.",
+					`${job.agent} finished · ${job.status} · ${formatDuration(Math.max(0, elapsed))}`,
+					`Job: ${job.id}`,
+					`Provider: ${job.provider ?? "unknown"}`,
+					`Model: ${modelDetail(job)}`,
+					totalTokens > 0 ? `Tokens: ${formatTokens(totalTokens)}` : undefined,
+					job.toolCount !== undefined ? `Tools: ${job.toolCount}` : undefined,
+					job.exitCode !== null && job.exitCode !== undefined ? `Exit code: ${job.exitCode}` : undefined,
 					"",
-					`Job ID: ${job.id}`,
-					`Agent: ${job.agent}`,
-					`Status: ${job.status}`,
-					`Exit code: ${job.exitCode}`,
-					`Result path: ${resultPath}`,
-					`Status path: ${statusPath(jobDir)}`,
-					"",
-					"Use the subagent tool with action=\"result\" and this jobId to inspect the saved result.",
+					"Validate the result before continuing. Use subagent result with this jobId to inspect the saved output.",
 					"",
 					preview ? `Result preview:\n\n${preview}` : "Result preview: (no output)",
-				].join("\n"),
+				].filter((line): line is string => Boolean(line)).join("\n"),
 				{ deliverAs: "followUp" },
 			);
 		} catch {
@@ -512,6 +549,7 @@ const SubagentParams = Type.Object({
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the subagent process" })),
+	verbose: Type.Optional(Type.Boolean({ description: "Include debug paths and full artifact details in status/list output. Default: false.", default: false })),
 });
 
 export default function (pi: ExtensionAPI) {
@@ -552,14 +590,14 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 
 			if (action === "list") {
 				const jobs = readJobs(sessionId);
-				return { content: [{ type: "text", text: formatJobList(jobs, "Async runs") }], details: { sessionId, baseDir, jobs } };
+				return { content: [{ type: "text", text: formatJobList(jobs, "Async runs", params.verbose ?? false) }], details: { sessionId, baseDir, jobs } };
 			}
 
 			if (action === "status" || action === "result" || action === "cancel") {
 				if (!params.jobId) {
 					if (action === "status") {
 						const activeJobs = readJobs(sessionId).filter((job) => job.status === "queued" || job.status === "running" || job.status === "paused");
-						return { content: [{ type: "text", text: formatJobList(activeJobs, "Active async runs") }], details: { sessionId, baseDir, jobs: activeJobs } };
+						return { content: [{ type: "text", text: formatJobList(activeJobs, "Active async runs", params.verbose ?? false) }], details: { sessionId, baseDir, jobs: activeJobs } };
 					}
 					return {
 						content: [{ type: "text", text: `jobId is required for action "${action}".` }],
@@ -597,7 +635,7 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 
 				if (action === "status") {
 					return {
-						content: [{ type: "text", text: formatJobStatusText(job) }],
+						content: [{ type: "text", text: formatJobStatusText(job, params.verbose ?? false) }],
 						details: { sessionId, baseDir, job },
 					};
 				}
@@ -655,14 +693,12 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 					{
 						type: "text",
 						text: [
-							"Started background subagent.",
+							`Started ${job.agent} · ${job.status}`,
+							`Job: ${job.id}`,
+							`Provider: ${job.provider ?? "unknown"}`,
+							`Model: ${modelDetail(job)}`,
 							"",
-							`Job ID: ${job.id}`,
-							`Agent: ${job.agent}`,
-							`Status: ${job.status}`,
-							`Job dir: ${job.jobDir}`,
-							"",
-							"The main agent will be notified when this job finishes.",
+							"You'll be notified when it finishes.",
 						].join("\n"),
 					},
 				],

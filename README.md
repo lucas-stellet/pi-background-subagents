@@ -39,6 +39,8 @@ Implemented:
   - `list`
   - `cancel`
 - Shows a compact async status widget inspired by `nicobailon/pi-subagents`.
+- Shows provider/model metadata in start, status, list, finish, and widget output when available.
+- Keeps artifact paths in tool `details` by default; pass `verbose: true` to include debug paths in list/status text.
 - Uses status vocabulary compatible with that representation:
   - `queued`
   - `running`
@@ -135,6 +137,16 @@ Inspect one job:
 {
   "action": "status",
   "jobId": "subagent-..."
+}
+```
+
+Include debug artifact paths in list/status output:
+
+```json
+{
+  "action": "status",
+  "jobId": "subagent-...",
+  "verbose": true
 }
 ```
 
