@@ -369,6 +369,23 @@ function formatJobList(jobs: JobMetadata[], heading = "Active async runs", verbo
 	return lines.join("\n").trimEnd();
 }
 
+function formatAgentList(ctx: ExtensionContext, agents: AgentConfig[], verbose = false): string {
+	if (agents.length === 0) return "No agents found.";
+	const lines = [`Available agents: ${agents.length}`, ""];
+	for (const agent of agents) {
+		const model = resolveInitialModel(ctx, agent);
+		lines.push(`- ${agent.name} · ${agent.source}`);
+		lines.push(`  ${agent.description}`);
+		lines.push(`  Provider: ${model.provider ?? "unknown"}`);
+		lines.push(`  Model: ${model.model ?? "unknown"}${model.source && model.source !== "unknown" ? ` (${model.source})` : ""}`);
+		if (agent.tools?.length) lines.push(`  Tools: ${agent.tools.join(", ")}`);
+		else lines.push("  Tools: default");
+		if (verbose) lines.push(`  File: ${agent.filePath}`);
+		lines.push("");
+	}
+	return lines.join("\n").trimEnd();
+}
+
 function activeWidgetJobs(): JobMetadata[] {
 	return Array.from(liveJobs.values()).filter((job) => job.status === "queued" || job.status === "running" || job.status === "paused" || job.status === "failed");
 }
@@ -607,7 +624,7 @@ async function startJob(
 	return job;
 }
 
-const ActionSchema = StringEnum(["start", "status", "result", "list", "cancel"] as const, {
+const ActionSchema = StringEnum(["start", "status", "result", "list", "list-agents", "cancel"] as const, {
 	description: 'Action to perform. Default is "start" when agent and task are provided.',
 	default: "start",
 });
@@ -670,6 +687,15 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 			if (action === "list") {
 				const jobs = readJobs(sessionId);
 				return { content: [{ type: "text", text: formatJobList(jobs, "Async runs", params.verbose ?? false) }], details: { sessionId, baseDir, jobs } };
+			}
+
+			if (action === "list-agents") {
+				const agentScope: AgentScope = params.agentScope ?? "user";
+				const discovery = discoverAgents(ctx.cwd, agentScope);
+				return {
+					content: [{ type: "text", text: formatAgentList(ctx, discovery.agents, params.verbose ?? false) }],
+					details: { sessionId, baseDir, agents: discovery.agents, projectAgentsDir: discovery.projectAgentsDir },
+				};
 			}
 
 			if (action === "status" || action === "result" || action === "cancel") {

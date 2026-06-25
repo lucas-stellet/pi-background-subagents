@@ -37,6 +37,7 @@ Implemented:
   - `status`
   - `result`
   - `list`
+  - `list-agents`
   - `cancel`
 - Shows a compact async status widget inspired by `nicobailon/pi-subagents`.
 - Shows provider/model metadata in start, status, list, finish, and widget output when available.
@@ -122,6 +123,25 @@ List jobs for the current parent session:
 ```json
 {
   "action": "list"
+}
+```
+
+List available agents:
+
+```json
+{
+  "action": "list-agents",
+  "agentScope": "both"
+}
+```
+
+Include agent file paths:
+
+```json
+{
+  "action": "list-agents",
+  "agentScope": "both",
+  "verbose": true
 }
 ```
 
