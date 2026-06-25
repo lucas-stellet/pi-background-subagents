@@ -59,6 +59,9 @@ interface JobMetadata {
 	model?: string;
 	modelSource?: "parent" | "agent" | "settings" | "runtime" | "unknown";
 	agentFilePath: string;
+	systemPromptMode: AgentConfig["systemPromptMode"];
+	inheritProjectContext: boolean;
+	inheritSkills: boolean;
 	usage: UsageStats;
 	lastUpdate?: number;
 	lastActivityAt?: number;
@@ -281,6 +284,18 @@ function modelDetail(job: Pick<JobMetadata, "model" | "modelSource">): string {
 	return `${job.model}${job.modelSource && job.modelSource !== "unknown" ? ` (${job.modelSource})` : ""}`;
 }
 
+function promptModeDetail(job: Partial<Pick<JobMetadata, "systemPromptMode" | "inheritProjectContext" | "inheritSkills">>): string {
+	const systemPromptMode = job.systemPromptMode ?? "append";
+	const inheritProjectContext = job.inheritProjectContext ?? true;
+	const inheritSkills = job.inheritSkills ?? true;
+	const parts = [
+		systemPromptMode === "replace" ? "replace Pi system prompt" : "append to Pi system prompt",
+		inheritProjectContext ? "project context on" : "project context off",
+		inheritSkills ? "skills on" : "skills off",
+	];
+	return parts.join("; ");
+}
+
 function compactJobLine(job: JobMetadata, now = Date.now()): string {
 	const parts = [job.agent, job.status, modelLabel(job), formatDuration(Math.max(0, now - Date.parse(job.startedAt)))];
 	const tokens = job.usage.input + job.usage.output;
@@ -343,6 +358,7 @@ function formatJobStatusText(job: JobMetadata, verbose = false): string {
 		`Provider: ${job.provider ?? "unknown"}`,
 		`Model: ${modelDetail(job)}`,
 		job.lastActivityAt && job.status === "running" ? `Activity: ${formatActivityLabel(job.lastActivityAt)}` : undefined,
+		`Prompt: ${promptModeDetail(job)}`,
 		job.currentTool ? `Current tool: ${job.currentTool}` : undefined,
 		job.errorMessage ? `Error: ${job.errorMessage}` : undefined,
 	];
@@ -380,6 +396,7 @@ function formatAgentList(ctx: ExtensionContext, agents: AgentConfig[], verbose =
 		lines.push(`  ${agent.description}`);
 		lines.push(`  Provider: ${model.provider ?? "unknown"}`);
 		lines.push(`  Model: ${model.model ?? "unknown"}${model.source && model.source !== "unknown" ? ` (${model.source})` : ""}`);
+		lines.push(`  Prompt: ${agent.systemPromptMode === "replace" ? "replace Pi system prompt" : "append to Pi system prompt"}; project context ${agent.inheritProjectContext ? "on" : "off"}; skills ${agent.inheritSkills ? "on" : "off"}`);
 		if (agent.tools?.length) lines.push(`  Tools: ${agent.tools.join(", ")}`);
 		else lines.push("  Tools: default");
 		if (verbose) lines.push(`  File: ${agent.filePath}`);
@@ -475,6 +492,9 @@ async function startJob(
 		model: initialModel.model,
 		modelSource: initialModel.source,
 		agentFilePath: agent.filePath,
+		systemPromptMode: agent.systemPromptMode,
+		inheritProjectContext: agent.inheritProjectContext,
+		inheritSkills: agent.inheritSkills,
 		usage: emptyUsage(),
 		lastUpdate: now,
 		lastActivityAt: now,
@@ -487,10 +507,12 @@ async function startJob(
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
 	if (initialModel.model) args.push("--model", initialModel.model);
+	if (!agent.inheritProjectContext) args.push("--no-context-files");
+	if (!agent.inheritSkills) args.push("--no-skills");
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 
 	const promptPath = await writePromptToTempFile(jobDir, agent.name, agent.systemPrompt);
-	if (promptPath) args.push("--append-system-prompt", promptPath);
+	if (promptPath) args.push(agent.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt", promptPath);
 	args.push(`Task: ${task}`);
 
 	const invocation = getPiInvocation(args);
@@ -612,6 +634,7 @@ async function startJob(
 					`Job: ${job.id}`,
 					`Provider: ${job.provider ?? "unknown"}`,
 					`Model: ${modelDetail(job)}`,
+					`Prompt: ${promptModeDetail(job)}`,
 					totalTokens > 0 ? `Tokens: ${formatTokens(totalTokens)}` : undefined,
 					job.toolCount !== undefined ? `Tools: ${job.toolCount}` : undefined,
 					job.exitCode !== null && job.exitCode !== undefined ? `Exit code: ${job.exitCode}` : undefined,
@@ -631,7 +654,7 @@ async function startJob(
 }
 
 const ActionSchema = StringEnum(["start", "status", "result", "list", "list-agents", "cancel"] as const, {
-	description: 'Action to perform. Default is "start" when agent and task are provided.',
+	description: 'Action to perform. start launches one background agent; list-agents shows available agents including prompt mode, project-context inheritance, skills inheritance, and tools; status/result/cancel inspect a job; list shows prior runs. Default is "start" when agent and task are provided.',
 	default: "start",
 });
 
@@ -642,9 +665,9 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 
 const SubagentParams = Type.Object({
 	action: Type.Optional(ActionSchema),
-	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (start action)" })),
-	task: Type.Optional(Type.String({ description: "Task to delegate (start action)" })),
-	jobId: Type.Optional(Type.String({ description: "Background job id (status/result/cancel actions)" })),
+	agent: Type.Optional(Type.String({ description: "Name of the agent to invoke (start action). Use action=list-agents first to inspect prompt mode, context/skills inheritance, model, and tools." })),
+	task: Type.Optional(Type.String({ description: "Task to delegate (start action). The selected agent's frontmatter controls whether its prompt replaces or appends to Pi's default prompt." })),
+	jobId: Type.Optional(Type.String({ description: "Background job id (status/result/cancel actions). Status output includes the prompt mode used for the run." })),
 	agentScope: Type.Optional(AgentScopeSchema),
 	confirmProjectAgents: Type.Optional(
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
@@ -674,13 +697,18 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 		description: [
 			"Start and manage background subagents with isolated context.",
 			"All subagents run in background and save artifacts under the OS temp directory.",
-			"Actions: start, status, result, list, cancel.",
+			"Actions: start, status, result, list, list-agents, cancel.",
+			"Agent frontmatter controls prompt isolation: systemPromptMode=replace uses --system-prompt and does not include Pi's default system prompt; systemPromptMode=append uses --append-system-prompt.",
+			"inheritProjectContext=false passes --no-context-files; inheritSkills=false passes --no-skills.",
+			"Use list-agents to inspect each agent's prompt mode, inherited context/skills, model, and tools before launching.",
 			`Default agent scope is user (${path.join(getAgentDir(), "agents")}).`,
 			`Project agents live in ${CONFIG_DIR_NAME}/agents and require agentScope=project or both.`,
 		].join(" "),
 		promptSnippet: "Start or inspect background subagents with isolated context",
 		promptGuidelines: [
 			"Use subagent to delegate codebase research or focused tasks to background agents when testing this background-only subagent extension.",
+			"Use action=\"list-agents\" when you need to confirm available subcommands/agents or whether an agent replaces or appends to Pi's system prompt.",
+			"Prefer agents with systemPromptMode=replace for tightly scoped roles to avoid inheriting Pi's full default system prompt unnecessarily.",
 			"After subagent reports a completed background job, use subagent with action=\"result\" to inspect and validate the result before continuing.",
 		],
 		parameters: SubagentParams,
@@ -808,6 +836,7 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 							`Job: ${job.id}`,
 							`Provider: ${job.provider ?? "unknown"}`,
 							`Model: ${modelDetail(job)}`,
+							`Prompt: ${promptModeDetail(job)}`,
 							"",
 							"You'll be notified when it finishes.",
 						].join("\n"),

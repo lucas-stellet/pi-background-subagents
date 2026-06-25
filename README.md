@@ -41,6 +41,11 @@ Implemented:
   - `cancel`
 - Shows a compact async status widget inspired by `nicobailon/pi-subagents`.
 - Shows provider/model metadata in start, status, list, finish, and widget output when available.
+- Respects prompt/context frontmatter:
+  - `systemPromptMode: replace` uses `--system-prompt` so the child does not inherit Pi's default system prompt.
+  - `systemPromptMode: append` uses `--append-system-prompt`.
+  - `inheritProjectContext: false` passes `--no-context-files`.
+  - `inheritSkills: false` passes `--no-skills`.
 - Resolves the child model before launch with this precedence: current parent Pi model, agent frontmatter `model`, then `settings.json` defaults.
 - Keeps artifact paths in tool `details` by default; pass `verbose: true` to include debug paths in list/status text.
 - Refreshes the async status widget every second while jobs are active so spinner, duration, and activity age stay current between subprocess events.
@@ -92,6 +97,9 @@ name: scout
 description: Fast codebase reconnaissance
 tools: read, grep, find, ls, bash
 model: anthropic/claude-haiku-4-5
+systemPromptMode: replace
+inheritProjectContext: true
+inheritSkills: false
 ---
 
 You are a focused scout agent. Inspect the codebase and return concise findings.
@@ -106,6 +114,9 @@ Optional fields:
 
 - `tools`: comma-separated Pi tools available to the child process
 - `model`: model override for this child process
+- `systemPromptMode`: `append` by default, or `replace` to use this agent prompt instead of Pi's default system prompt
+- `inheritProjectContext`: `true` by default; when `false`, launches the child with `--no-context-files`
+- `inheritSkills`: `true` by default; when `false`, launches the child with `--no-skills`
 
 ## Tool usage
 
@@ -127,7 +138,7 @@ List jobs for the current parent session:
 }
 ```
 
-List available agents:
+List available agents, including each agent's prompt mode, project context inheritance, skills inheritance, model, and tools:
 
 ```json
 {

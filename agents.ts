@@ -11,11 +11,16 @@ import { CONFIG_DIR_NAME, getAgentDir, parseFrontmatter } from "@earendil-works/
 
 export type AgentScope = "user" | "project" | "both";
 
+export type SystemPromptMode = "append" | "replace";
+
 export interface AgentConfig {
 	name: string;
 	description: string;
 	tools?: string[];
 	model?: string;
+	systemPromptMode: SystemPromptMode;
+	inheritProjectContext: boolean;
+	inheritSkills: boolean;
 	systemPrompt: string;
 	source: "user" | "project";
 	filePath: string;
@@ -24,6 +29,16 @@ export interface AgentConfig {
 export interface AgentDiscoveryResult {
 	agents: AgentConfig[];
 	projectAgentsDir: string | null;
+}
+
+function parseBoolean(value: unknown, defaultValue: boolean): boolean {
+	if (value === true || value === "true") return true;
+	if (value === false || value === "false") return false;
+	return defaultValue;
+}
+
+function parseSystemPromptMode(value: unknown): SystemPromptMode {
+	return value === "replace" ? "replace" : "append";
 }
 
 function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig[] {
@@ -50,7 +65,7 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			continue;
 		}
 
-		const { frontmatter, body } = parseFrontmatter<Record<string, string>>(content);
+		const { frontmatter, body } = parseFrontmatter<Record<string, any>>(content);
 		if (!frontmatter.name || !frontmatter.description) continue;
 
 		const tools = frontmatter.tools
@@ -63,6 +78,9 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			description: frontmatter.description,
 			tools: tools && tools.length > 0 ? tools : undefined,
 			model: frontmatter.model,
+			systemPromptMode: parseSystemPromptMode(frontmatter.systemPromptMode),
+			inheritProjectContext: parseBoolean(frontmatter.inheritProjectContext, true),
+			inheritSkills: parseBoolean(frontmatter.inheritSkills, true),
 			systemPrompt: body,
 			source,
 			filePath,
