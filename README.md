@@ -46,7 +46,7 @@ Implemented:
   - `systemPromptMode: append` uses `--append-system-prompt`.
   - `inheritProjectContext: false` passes `--no-context-files`.
   - `inheritSkills: false` passes `--no-skills`.
-- Resolves the child model before launch with this precedence: current parent Pi model, agent frontmatter `model`, then `settings.json` defaults.
+- Resolves the child model before launch with this precedence: agent frontmatter `model`, `settings.json` subagent override, `settings.json` defaults, then current parent Pi model.
 - Keeps artifact paths in tool `details` by default; pass `verbose: true` to include debug paths in list/status text.
 - Refreshes the async status widget every second while jobs are active so spinner, duration, and activity age stay current between subprocess events.
 - Uses status vocabulary compatible with that representation:

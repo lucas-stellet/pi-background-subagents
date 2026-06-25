@@ -249,7 +249,7 @@ function currentContextModel(ctx: ExtensionContext): string | undefined {
 	return modelPattern(model.provider, model.id);
 }
 
-function settingsDefaultModel(ctx: ExtensionContext): string | undefined {
+function loadApplicableSettings(ctx: ExtensionContext): Array<Record<string, any>> {
 	const globalSettingsPath = path.join(getAgentDir(), "settings.json");
 	const settings: Array<Record<string, any>> = [];
 	const globalSettings = readJson<Record<string, any>>(globalSettingsPath);
@@ -261,16 +261,30 @@ function settingsDefaultModel(ctx: ExtensionContext): string | undefined {
 		if (projectSettings) settings.push(projectSettings);
 	}
 
+	return settings;
+}
+
+function settingsModel(ctx: ExtensionContext, agent: AgentConfig): string | undefined {
+	const settings = loadApplicableSettings(ctx);
 	const merged = Object.assign({}, ...settings);
-	return modelPattern(merged.defaultProvider, merged.defaultModel);
+	const defaultProvider = merged.defaultProvider;
+	const defaultModel = merged.defaultModel;
+
+	for (let i = settings.length - 1; i >= 0; i--) {
+		const override = settings[i]?.subagents?.agentOverrides?.[agent.name];
+		const overrideModel = override?.model;
+		if (overrideModel) return modelPattern(override.provider ?? defaultProvider, overrideModel);
+	}
+
+	return modelPattern(defaultProvider, defaultModel);
 }
 
 function resolveInitialModel(ctx: ExtensionContext, agent: AgentConfig): { model?: string; provider?: string; source: JobMetadata["modelSource"] } {
+	if (agent.model) return { model: agent.model, provider: inferProvider(agent.model), source: "agent" };
+	const configuredModel = settingsModel(ctx, agent);
+	if (configuredModel) return { model: configuredModel, provider: inferProvider(configuredModel), source: "settings" };
 	const parentModel = currentContextModel(ctx);
 	if (parentModel) return { model: parentModel, provider: inferProvider(parentModel), source: "parent" };
-	if (agent.model) return { model: agent.model, provider: inferProvider(agent.model), source: "agent" };
-	const settingsModel = settingsDefaultModel(ctx);
-	if (settingsModel) return { model: settingsModel, provider: inferProvider(settingsModel), source: "settings" };
 	return { source: "unknown" };
 }
 
