@@ -30,7 +30,7 @@ const JOBS_ROOT_NAME = "pi-subagents";
 const RESULT_PREVIEW_CHARS = 20_000;
 const WIDGET_KEY = "subagent-async";
 
-type JobStatus = "queued" | "running" | "complete" | "failed" | "paused";
+type JobStatus = "queued" | "running" | "complete" | "failed" | "paused" | "cancelled";
 
 interface UsageStats {
 	input: number;
@@ -308,6 +308,7 @@ function statusGlyph(status: JobStatus): string {
 	if (status === "queued") return "◦";
 	if (status === "complete") return "✓";
 	if (status === "paused") return "■";
+	if (status === "cancelled") return "⊘";
 	return "✗";
 }
 
@@ -322,6 +323,7 @@ function widgetActivity(job: JobMetadata, now = Date.now()): string {
 	if (job.status === "running") return "thinking…";
 	if (job.status === "queued") return "queued…";
 	if (job.status === "paused") return "Paused";
+	if (job.status === "cancelled") return "Cancelled";
 	if (job.status === "failed") return "Failed";
 	return "Done";
 }
@@ -388,6 +390,10 @@ function formatAgentList(ctx: ExtensionContext, agents: AgentConfig[], verbose =
 
 function activeWidgetJobs(): JobMetadata[] {
 	return Array.from(liveJobs.values()).filter((job) => job.status === "queued" || job.status === "running" || job.status === "paused" || job.status === "failed");
+}
+
+function visibleRunJobs(jobs: JobMetadata[]): JobMetadata[] {
+	return jobs.filter((job) => job.status !== "cancelled");
 }
 
 function ensureWidgetRefreshTimer(ctx: ExtensionContext | null = lastUiContext): void {
@@ -586,13 +592,13 @@ async function startJob(
 		job.currentTool = undefined;
 		job.currentToolArgs = undefined;
 		job.currentToolStartedAt = undefined;
-		if (wasCancelled) job.status = "paused";
+		if (wasCancelled) job.status = "cancelled";
 		else if (signal) job.status = "failed";
 		else if ((job.exitCode ?? 0) !== 0 || job.stopReason === "error" || job.stopReason === "aborted") job.status = "failed";
 		else job.status = "complete";
 		if (!job.errorMessage && stderr.trim() && job.status === "failed") job.errorMessage = stderr.trim().slice(0, 4000);
 		await writeJson(statusPath(jobDir), job);
-		if (job.status === "complete") liveJobs.delete(jobId);
+		if (job.status === "complete" || job.status === "cancelled") liveJobs.delete(jobId);
 		renderAsyncWidget();
 		if (activeWidgetJobs().length === 0) stopWidgetRefreshTimer();
 
@@ -685,7 +691,7 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 			const action = params.action ?? (params.agent && params.task ? "start" : "list");
 
 			if (action === "list") {
-				const jobs = readJobs(sessionId);
+				const jobs = visibleRunJobs(readJobs(sessionId));
 				return { content: [{ type: "text", text: formatJobList(jobs, "Async runs", params.verbose ?? false) }], details: { sessionId, baseDir, jobs } };
 			}
 
@@ -729,10 +735,10 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 					setTimeout(() => {
 						if (!proc.killed) proc.kill("SIGKILL");
 					}, 5000);
-					job.status = "paused";
+					job.status = "cancelled";
 					job.finishedAt = new Date().toISOString();
 					job.lastUpdate = Date.now();
-					liveJobs.set(job.id, job);
+					liveJobs.delete(job.id);
 					await writeJson(statusPath(jobDir), job);
 					renderAsyncWidget(ctx);
 					return { content: [{ type: "text", text: `Cancellation requested for ${job.id}.` }], details: { sessionId, baseDir, job } };

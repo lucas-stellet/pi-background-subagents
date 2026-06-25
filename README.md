@@ -50,6 +50,7 @@ Implemented:
   - `complete`
   - `failed`
   - `paused`
+  - `cancelled`
 
 ## Installation
 
@@ -189,6 +190,8 @@ Cancel a running job:
   "jobId": "subagent-..."
 }
 ```
+
+Cancelled jobs are marked `cancelled` and removed from the live widget and default run lists.
 
 ## Runtime behavior
 
