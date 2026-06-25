@@ -204,6 +204,16 @@ Cancel a running job:
 
 Cancelled jobs are marked `cancelled` and removed from the live widget and default run lists.
 
+## Project-local agent confirmation
+
+Project-local agents run without an interactive confirmation by default. To opt back into the trust prompt for a specific call, pass:
+
+```json
+{
+  "confirmProjectAgents": true
+}
+```
+
 ## Runtime behavior
 
 A child agent is launched with a separate Pi process roughly equivalent to:

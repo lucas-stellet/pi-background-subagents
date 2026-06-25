@@ -684,7 +684,7 @@ const SubagentParams = Type.Object({
 	jobId: Type.Optional(Type.String({ description: "Background job id (status/result/cancel actions). Status output includes the prompt mode used for the run." })),
 	agentScope: Type.Optional(AgentScopeSchema),
 	confirmProjectAgents: Type.Optional(
-		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
+		Type.Boolean({ description: "Prompt before running project-local agents. Default: false.", default: false }),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the subagent process" })),
 	verbose: Type.Optional(Type.Boolean({ description: "Include debug paths and full artifact details in status/list output. Default: false.", default: false })),
@@ -829,7 +829,7 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 				};
 			}
 
-			if (agent.source === "project" && (params.confirmProjectAgents ?? true) && ctx.hasUI) {
+			if (agent.source === "project" && (params.confirmProjectAgents ?? false) && ctx.hasUI) {
 				const ok = await ctx.ui.confirm(
 					"Run project-local subagent?",
 					`Agent: ${agent.name}\nSource: ${agent.filePath}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
