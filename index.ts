@@ -1042,6 +1042,7 @@ async function runChainPhase(pi: ExtensionAPI, ctx: ExtensionContext, chainRun: 
 		phaseRun.outputs = produced;
 		await writeJson(chainStatusPath(chainRun.chainDir), chainRun);
 		renderAsyncWidget(ctx);
+		await pi.sendUserMessage(`Chain phase complete: ${chainRun.chain} ${phaseRun.stageId}/${phaseRun.phaseId}. Continuing to the next phase if any.`, { deliverAs: "followUp" });
 		return true;
 	}
 }
@@ -1073,6 +1074,7 @@ async function continueChain(pi: ExtensionAPI, ctx: ExtensionContext, chainRun: 
 	liveChains.delete(chainRun.id);
 	await writeJson(chainStatusPath(chainRun.chainDir), chainRun);
 	renderAsyncWidget(ctx);
+	await pi.sendUserMessage(`Chain complete: ${chainRun.chain}. Use chain({ action: "result", chainId: "${chainRun.id}" }) to read the outputs.`, { deliverAs: "followUp" });
 }
 
 const ActionSchema = StringEnum(["start", "status", "result", "list", "list-agents", "cancel"] as const, {
@@ -1189,8 +1191,14 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 	pi.registerTool({
 		name: "chain",
 		label: "Chain",
-		description: "List, start, inspect, and resume YAML-defined chains of background subagents.",
-		promptSnippet: "Run a chain of subagents with explicit handoffs",
+		description: "List, start, inspect, and resume YAML-defined chains of background subagents. Chains run asynchronously after start; do not poll status in a loop. The runtime sends concise follow-up notifications when phases finish, when the chain fails, and when final results are ready. Use status only for an explicit user request or suspected blocker; use result after the completion notification.",
+		promptSnippet: "Run an asynchronous chain of subagents with explicit handoffs",
+		promptGuidelines: [
+			"After chain start, tell the user it is running and wait for follow-up notifications instead of repeatedly calling chain status.",
+			"Do not poll chain status just to see whether the next phase has started; phase transitions are reported by concise follow-up messages.",
+			"Use chain status only when the user asks for progress or when there is a concrete reason to suspect a blocker.",
+			"Use chain result after the completion notification to inspect outputs and summarize the outcome.",
+		],
 		parameters: ChainParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			lastUiContext = ctx;
@@ -1298,7 +1306,7 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 				await writeJson(chainStatusPath(chainDir), chainRun);
 				renderAsyncWidget(ctx);
 			});
-			return { content: [{ type: "text", text: [`Started chain ${chain.name} · running`, `Chain: ${chainId}`, `Dir: ${chainDir}`, "", "Use chain status to inspect progress."].join("\n") }], details: { sessionId, baseDir, chain: chainRun } };
+			return { content: [{ type: "text", text: [`Started chain ${chain.name} · running`, `Chain: ${chainId}`, `Dir: ${chainDir}`, "", "No polling needed: the chain will send concise follow-up messages for phase transitions, failure, and completion."].join("\n") }], details: { sessionId, baseDir, chain: chainRun } };
 		},
 	});
 
