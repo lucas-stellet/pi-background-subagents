@@ -646,7 +646,7 @@ function buildAsyncWidgetSection(jobs: JobMetadata[], chains: ChainRunMetadata[]
 	if (failedJobs) parts.push(`${failedJobs} agents failed`);
 	if (failedChains) parts.push(`${failedChains} chains failed`);
 	const summary = parts.join(", ") || `${jobs.length + chains.length} async runs`;
-	const lines = [`${runningJobs || runningChains ? runningGlyph(now) : "○"} Async agents · ${summary}`];
+	const lines = [`◆ Async agents · ${summary}`];
 	for (const job of jobs.slice(0, 3)) {
 		const stats = widgetStats(job, now);
 		const status = job.status === "complete" ? "done" : job.status;
