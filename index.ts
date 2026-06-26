@@ -107,6 +107,7 @@ interface ChainPhaseRunMetadata {
 	stageId: string;
 	phaseId: string;
 	agent: string;
+	model?: string;
 	status: ChainPhaseRunStatus;
 	attempts: ChainAttemptMetadata[];
 	outputs: string[];
@@ -576,6 +577,35 @@ function latestAttempt(phase: ChainPhaseRunMetadata): ChainAttemptMetadata | und
 	return phase.attempts[phase.attempts.length - 1];
 }
 
+function chainPhaseJob(phase: ChainPhaseRunMetadata): JobMetadata | undefined {
+	const attempt = latestAttempt(phase);
+	if (!attempt?.jobDir) return undefined;
+	return readJson<JobMetadata>(statusPath(attempt.jobDir)) ?? undefined;
+}
+
+function stripProvider(model: string): string {
+	const slashIndex = model.indexOf("/");
+	return slashIndex >= 0 ? model.slice(slashIndex + 1) : model;
+}
+
+function chainPhaseModelLabel(phase: ChainPhaseRunMetadata, job?: JobMetadata): string {
+	const model = job?.model ?? phase.model;
+	return model ? stripProvider(model) : "model unknown";
+}
+
+function chainPhaseRuntimeDetails(phase: ChainPhaseRunMetadata, now = Date.now()): string[] {
+	const job = chainPhaseJob(phase);
+	const attempt = latestAttempt(phase);
+	const details = [chainPhaseModelLabel(phase, job)];
+	const startedAt = job?.startedAt ?? attempt?.startedAt;
+	if (startedAt) details.push(`${phase.status === "running" ? "active" : "ran"} ${formatDuration(Math.max(0, now - Date.parse(startedAt)))}`);
+	if (job?.currentTool) details.push(`tool ${job.currentTool}`);
+	else if (job?.lastActivityAt) details.push(`last ${formatActivityLabel(job.lastActivityAt, now)}`);
+	if (job?.toolCount !== undefined) details.push(`${job.toolCount} tools`);
+	if (job?.turnCount !== undefined) details.push(`${job.turnCount} turns`);
+	return details;
+}
+
 function chainProgress(chain: ChainRunMetadata): { complete: number; running: number; pending: number; failed: number; total: number } {
 	return {
 		complete: chain.phases.filter((phase) => phase.status === "complete").length,
@@ -609,9 +639,7 @@ function renderChainWidgetLines(chain: ChainRunMetadata, now = Date.now()): stri
 			lines.push(`    ${chainPhaseGlyph(status)} ${stage.id} · parallel · ${done}/${phases.length} done${running ? ` · ${running} running` : ""}`);
 			shownRows++;
 			for (const phase of phases.slice(0, 3)) {
-				const attempt = latestAttempt(phase);
-				const activity = phase.status === "running" && attempt?.startedAt ? ` · ${formatDuration(Math.max(0, now - Date.parse(attempt.startedAt)))}` : "";
-				lines.push(`      ${chainPhaseGlyph(phase.status)} ${phase.phaseId} · ${phase.status} · ${phase.agent}${activity}`);
+				lines.push(`      ${chainPhaseGlyph(phase.status)} ${phase.phaseId} · ${phase.status} · ${chainPhaseRuntimeDetails(phase, now).join(" · ")}`);
 				shownPhaseIds.add(phase.phaseId);
 			}
 			if (phases.length > 3) lines.push(`      +${phases.length - 3} phases`);
@@ -620,9 +648,8 @@ function renderChainWidgetLines(chain: ChainRunMetadata, now = Date.now()): stri
 		for (const phase of phases) {
 			if (shownRows >= 5) continue;
 			const attempt = latestAttempt(phase);
-			const activity = phase.status === "running" && attempt?.startedAt ? ` · ${formatDuration(Math.max(0, now - Date.parse(attempt.startedAt)))}` : "";
 			const error = phase.status === "failed" && attempt?.errorMessage ? ` · ${attempt.errorMessage.slice(0, 80)}` : "";
-			lines.push(`    ${chainPhaseGlyph(phase.status)} ${phase.phaseId} · ${phase.status} · ${phase.agent}${activity}${error}`);
+			lines.push(`    ${chainPhaseGlyph(phase.status)} ${phase.phaseId} · ${phase.status} · ${chainPhaseRuntimeDetails(phase, now).join(" · ")}${error}`);
 			shownRows++;
 			shownPhaseIds.add(phase.phaseId);
 		}
@@ -925,7 +952,7 @@ function formatChainRunStatus(chain: ChainRunMetadata, verbose = false): string 
 	if (chain.errorMessage) lines.push(`Error: ${chain.errorMessage}`);
 	lines.push("", "Phases:");
 	for (const phase of chain.phases) {
-		lines.push(`- ${phase.stageId}/${phase.phaseId} · ${phase.status} · attempts ${phase.attempts.length}${phase.outputs.length ? ` · outputs ${phase.outputs.join(", ")}` : ""}`);
+		lines.push(`- ${phase.stageId}/${phase.phaseId} · ${phase.status} · ${chainPhaseRuntimeDetails(phase).join(" · ")} · attempts ${phase.attempts.length}${phase.outputs.length ? ` · outputs ${phase.outputs.join(", ")}` : ""}`);
 		if (verbose) for (const attempt of phase.attempts) lines.push(`  - attempt ${attempt.attempt}: ${attempt.status}${attempt.jobId ? ` job=${attempt.jobId}` : ""}${attempt.errorMessage ? ` error=${attempt.errorMessage}` : ""}`);
 	}
 	if (verbose) lines.push("", `Dir: ${chain.chainDir}`, `Outputs: ${chainOutputsDir(chain.chainDir)}`);
@@ -1279,7 +1306,7 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 				startedAt: new Date().toISOString(),
 				chainFilePath: chain.filePath,
 				stages: chain.stages.map((stage) => ({ id: stage.id, mode: stage.mode, phaseIds: stage.phases.map((phase) => phase.id) })),
-				phases: chain.stages.flatMap((stage) => stage.phases.map((phase) => ({ stageId: stage.id, phaseId: phase.id, agent: phase.agent, status: "pending" as ChainPhaseRunStatus, attempts: [], outputs: [] }))),
+				phases: chain.stages.flatMap((stage) => stage.phases.map((phase) => ({ stageId: stage.id, phaseId: phase.id, agent: phase.agent, model: phase.model, status: "pending" as ChainPhaseRunStatus, attempts: [], outputs: [] }))),
 			};
 			liveChains.set(chainRun.id, chainRun);
 			await writeJson(chainStatusPath(chainDir), chainRun);
