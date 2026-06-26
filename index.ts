@@ -594,7 +594,7 @@ function currentChainStep(chain: ChainRunMetadata): number {
 function renderChainWidgetLines(chain: ChainRunMetadata, now = Date.now()): string[] {
 	const progress = chainProgress(chain);
 	const glyph = chain.status === "running" ? runningGlyph(now) : chain.status === "complete" ? "✓" : "✗";
-	const lines = [`  ${glyph} Chain ${chain.chain} · ${chain.status} · step ${currentChainStep(chain)}/${progress.total} · ${formatDuration(Math.max(0, now - Date.parse(chain.startedAt)))}`];
+	const lines = [`  ${glyph} ${chain.chain} · ${chain.status} · step ${currentChainStep(chain)}/${progress.total} · ${formatDuration(Math.max(0, now - Date.parse(chain.startedAt)))}`];
 	const phaseById = new Map(chain.phases.map((phase) => [phase.phaseId, phase]));
 	const stages = chain.stages?.length ? chain.stages : chain.phases.map((phase) => ({ id: phase.stageId, mode: "sequential" as ChainMode, phaseIds: [phase.phaseId] }));
 	const shownPhaseIds = new Set<string>();
