@@ -24,12 +24,13 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
-import { type ChainConfig, type ChainPhase, type ChainScope, discoverChains } from "./chains.ts";
+import { type ChainConfig, type ChainMode, type ChainPhase, type ChainScope, discoverChains } from "./chains.ts";
 
 const CUSTOM_TYPE = "background-subagents";
 const JOBS_ROOT_NAME = "pi-subagents";
 const RESULT_PREVIEW_CHARS = 20_000;
-const WIDGET_KEY = "subagent-async";
+const WIDGET_KEY = "pi-subagents";
+const LEGACY_WIDGET_KEY = "subagent-async";
 const CHAIN_JOBS_ROOT_NAME = "pi-chains";
 const READ_TRUNCATE_LINES = 2000;
 const READ_TRUNCATE_BYTES = 50_000;
@@ -111,6 +112,12 @@ interface ChainPhaseRunMetadata {
 	outputs: string[];
 }
 
+interface ChainRunStageMetadata {
+	id: string;
+	mode: ChainMode;
+	phaseIds: string[];
+}
+
 interface ChainRunMetadata {
 	id: string;
 	sessionId: string;
@@ -126,6 +133,7 @@ interface ChainRunMetadata {
 	failedPhaseId?: string;
 	errorMessage?: string;
 	chainFilePath: string;
+	stages: ChainRunStageMetadata[];
 	phases: ChainPhaseRunMetadata[];
 }
 
@@ -142,6 +150,7 @@ interface ChainPhaseContext {
 const runningJobs = new Map<string, ChildProcessWithoutNullStreams>();
 const cancelledJobs = new Set<string>();
 const liveJobs = new Map<string, JobMetadata>();
+const liveChains = new Map<string, ChainRunMetadata>();
 let lastUiContext: ExtensionContext | null = null;
 let widgetRefreshTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -498,20 +507,54 @@ function activeWidgetJobs(): JobMetadata[] {
 	return Array.from(liveJobs.values()).filter((job) => job.status === "queued" || job.status === "running" || job.status === "paused" || job.status === "failed");
 }
 
+function activeWidgetChains(): ChainRunMetadata[] {
+	return Array.from(liveChains.values()).filter((chain) => chain.status === "running" || chain.status === "failed");
+}
+
+function hasActiveWidgetItems(): boolean {
+	return activeWidgetJobs().length > 0 || activeWidgetChains().length > 0;
+}
+
 function visibleRunJobs(jobs: JobMetadata[]): JobMetadata[] {
 	return jobs.filter((job) => job.status !== "cancelled");
 }
 
+function widgetStackSectionPath(ctx: ExtensionContext): string {
+	return path.join(getAgentDir(), "widget-stack", "sessions", getSessionId(ctx), "sections", `${WIDGET_KEY}.json`);
+}
+
+async function publishWidgetStackSection(ctx: ExtensionContext, lines: string[], summary: string, active: boolean): Promise<void> {
+	const finalPath = widgetStackSectionPath(ctx);
+	await fs.promises.mkdir(path.dirname(finalPath), { recursive: true });
+	const tmpPath = `${finalPath}.tmp`;
+	await fs.promises.writeFile(tmpPath, JSON.stringify({
+		id: WIDGET_KEY,
+		title: "Async agents",
+		order: 10,
+		priority: 100,
+		updatedAt: Date.now(),
+		ttlMs: 5000,
+		active,
+		summary,
+		lines,
+	}, null, 2));
+	await fs.promises.rename(tmpPath, finalPath);
+}
+
+async function clearWidgetStackSection(ctx: ExtensionContext): Promise<void> {
+	await fs.promises.unlink(widgetStackSectionPath(ctx)).catch(() => undefined);
+}
+
 function ensureWidgetRefreshTimer(ctx: ExtensionContext | null = lastUiContext): void {
 	if (!ctx?.hasUI) return;
-	if (activeWidgetJobs().length === 0) {
+	if (!hasActiveWidgetItems()) {
 		stopWidgetRefreshTimer();
 		return;
 	}
 	if (widgetRefreshTimer) return;
 	widgetRefreshTimer = setInterval(() => {
 		renderAsyncWidget();
-		if (activeWidgetJobs().length === 0) stopWidgetRefreshTimer();
+		if (!hasActiveWidgetItems()) stopWidgetRefreshTimer();
 	}, 1000);
 	widgetRefreshTimer.unref?.();
 }
@@ -522,33 +565,111 @@ function stopWidgetRefreshTimer(): void {
 	widgetRefreshTimer = null;
 }
 
-function renderAsyncWidget(ctx: ExtensionContext | null = lastUiContext): void {
-	if (!ctx?.hasUI) return;
-	const jobs = activeWidgetJobs();
-	if (jobs.length === 0) {
-		try { ctx.ui.setWidget(WIDGET_KEY, undefined); } catch { /* ignore stale UI */ }
-		stopWidgetRefreshTimer();
-		return;
+function chainPhaseGlyph(status: ChainPhaseRunStatus): string {
+	if (status === "running") return runningGlyph();
+	if (status === "complete") return "✓";
+	if (status === "failed") return "✗";
+	return "◦";
+}
+
+function latestAttempt(phase: ChainPhaseRunMetadata): ChainAttemptMetadata | undefined {
+	return phase.attempts[phase.attempts.length - 1];
+}
+
+function chainProgress(chain: ChainRunMetadata): { complete: number; running: number; pending: number; failed: number; total: number } {
+	return {
+		complete: chain.phases.filter((phase) => phase.status === "complete").length,
+		running: chain.phases.filter((phase) => phase.status === "running").length,
+		pending: chain.phases.filter((phase) => phase.status === "pending").length,
+		failed: chain.phases.filter((phase) => phase.status === "failed").length,
+		total: chain.phases.length,
+	};
+}
+
+function currentChainStep(chain: ChainRunMetadata): number {
+	const index = chain.phases.findIndex((phase) => phase.status === "running" || phase.status === "failed" || phase.status === "pending");
+	return index >= 0 ? index + 1 : chain.phases.length;
+}
+
+function renderChainWidgetLines(chain: ChainRunMetadata, now = Date.now()): string[] {
+	const progress = chainProgress(chain);
+	const glyph = chain.status === "running" ? runningGlyph(now) : chain.status === "complete" ? "✓" : "✗";
+	const lines = [`  ${glyph} Chain ${chain.chain} · ${chain.status} · step ${currentChainStep(chain)}/${progress.total} · ${formatDuration(Math.max(0, now - Date.parse(chain.startedAt)))}`];
+	const phaseById = new Map(chain.phases.map((phase) => [phase.phaseId, phase]));
+	const stages = chain.stages?.length ? chain.stages : chain.phases.map((phase) => ({ id: phase.stageId, mode: "sequential" as ChainMode, phaseIds: [phase.phaseId] }));
+	const shownPhaseIds = new Set<string>();
+	let shownRows = 0;
+	for (const stage of stages) {
+		const phases = stage.phaseIds.map((id) => phaseById.get(id)).filter((phase): phase is ChainPhaseRunMetadata => Boolean(phase));
+		if (stage.mode === "parallel" && phases.length > 1) {
+			const done = phases.filter((phase) => phase.status === "complete").length;
+			const running = phases.filter((phase) => phase.status === "running").length;
+			const failed = phases.filter((phase) => phase.status === "failed").length;
+			const status: ChainPhaseRunStatus = failed ? "failed" : running ? "running" : done === phases.length ? "complete" : "pending";
+			lines.push(`    ${chainPhaseGlyph(status)} ${stage.id} · parallel · ${done}/${phases.length} done${running ? ` · ${running} running` : ""}`);
+			shownRows++;
+			for (const phase of phases.slice(0, 3)) {
+				const attempt = latestAttempt(phase);
+				const activity = phase.status === "running" && attempt?.startedAt ? ` · ${formatDuration(Math.max(0, now - Date.parse(attempt.startedAt)))}` : "";
+				lines.push(`      ${chainPhaseGlyph(phase.status)} ${phase.phaseId} · ${phase.status} · ${phase.agent}${activity}`);
+				shownPhaseIds.add(phase.phaseId);
+			}
+			if (phases.length > 3) lines.push(`      +${phases.length - 3} phases`);
+			continue;
+		}
+		for (const phase of phases) {
+			if (shownRows >= 5) continue;
+			const attempt = latestAttempt(phase);
+			const activity = phase.status === "running" && attempt?.startedAt ? ` · ${formatDuration(Math.max(0, now - Date.parse(attempt.startedAt)))}` : "";
+			const error = phase.status === "failed" && attempt?.errorMessage ? ` · ${attempt.errorMessage.slice(0, 80)}` : "";
+			lines.push(`    ${chainPhaseGlyph(phase.status)} ${phase.phaseId} · ${phase.status} · ${phase.agent}${activity}${error}`);
+			shownRows++;
+			shownPhaseIds.add(phase.phaseId);
+		}
 	}
-	ensureWidgetRefreshTimer(ctx);
-	const now = Date.now();
-	const running = jobs.filter((job) => job.status === "running").length;
+	const hidden = Math.max(0, chain.phases.length - shownPhaseIds.size);
+	if (hidden > 0) lines.push(`    +${hidden} phases`);
+	if (chain.status === "failed") lines.push(`    Resume: chain({ action: "resume", chainId: "${chain.id}" })`);
+	return lines;
+}
+
+function buildAsyncWidgetSection(jobs: JobMetadata[], chains: ChainRunMetadata[], now = Date.now()): { lines: string[]; summary: string; active: boolean } {
+	const runningJobs = jobs.filter((job) => job.status === "running").length;
 	const queued = jobs.filter((job) => job.status === "queued").length;
-	const failed = jobs.filter((job) => job.status === "failed").length;
-	const paused = jobs.filter((job) => job.status === "paused").length;
+	const failedJobs = jobs.filter((job) => job.status === "failed").length;
+	const runningChains = chains.filter((chain) => chain.status === "running").length;
+	const failedChains = chains.filter((chain) => chain.status === "failed").length;
 	const parts: string[] = [];
-	if (running) parts.push(running === 1 ? "1 agent running" : `${running} agents running`);
+	if (runningJobs) parts.push(runningJobs === 1 ? "1 agent running" : `${runningJobs} agents running`);
+	if (runningChains) parts.push(runningChains === 1 ? "1 chain running" : `${runningChains} chains running`);
 	if (queued) parts.push(`${queued} queued`);
-	if (failed) parts.push(`${failed} failed`);
-	if (paused) parts.push(`${paused} paused`);
-	const lines = [`${running ? runningGlyph(now) : "○"} Async agents · ${parts.join(", ") || `${jobs.length} total`}`];
-	for (const job of jobs.slice(0, 4)) {
+	if (failedJobs) parts.push(`${failedJobs} agents failed`);
+	if (failedChains) parts.push(`${failedChains} chains failed`);
+	const summary = parts.join(", ") || `${jobs.length + chains.length} async runs`;
+	const lines = [`${runningJobs || runningChains ? runningGlyph(now) : "○"} Async agents · ${summary}`];
+	for (const job of jobs.slice(0, 3)) {
 		const stats = widgetStats(job, now);
 		const status = job.status === "complete" ? "done" : job.status;
 		lines.push(`  ${statusGlyph(job.status)} ${job.agent} · ${status}${stats ? ` · ${stats}` : ""} · ${widgetActivity(job, now)}`);
 	}
-	if (jobs.length > 4) lines.push(`  +${jobs.length - 4} more`);
-	try { ctx.ui.setWidget(WIDGET_KEY, lines); } catch { /* ignore stale UI */ }
+	for (const chain of chains.slice(0, 2)) lines.push(...renderChainWidgetLines(chain, now));
+	const hidden = Math.max(0, jobs.length - 3) + Math.max(0, chains.length - 2);
+	if (hidden > 0) lines.push(`  +${hidden} more`);
+	return { lines, summary, active: Boolean(runningJobs || runningChains || queued) };
+}
+
+function renderAsyncWidget(ctx: ExtensionContext | null = lastUiContext): void {
+	if (!ctx?.hasUI) return;
+	const jobs = activeWidgetJobs();
+	const chains = activeWidgetChains();
+	if (jobs.length === 0 && chains.length === 0) {
+		void clearWidgetStackSection(ctx);
+		stopWidgetRefreshTimer();
+		return;
+	}
+	ensureWidgetRefreshTimer(ctx);
+	const section = buildAsyncWidgetSection(jobs, chains);
+	void publishWidgetStackSection(ctx, section.lines, section.summary, section.active).catch(() => undefined);
 }
 
 interface StartJobOptions {
@@ -630,7 +751,7 @@ async function startJob(
 	job.pid = proc.pid;
 	await writeJson(statusPath(jobDir), job);
 	runningJobs.set(jobId, proc);
-	liveJobs.set(jobId, job);
+	if (!options.skipWidget) liveJobs.set(jobId, job);
 	if (!options.skipWidget) renderAsyncWidget(ctx);
 
 	const stdoutPath = path.join(jobDir, "stdout.jsonl");
@@ -660,7 +781,7 @@ async function startJob(
 			job.lastUpdate = job.currentToolStartedAt;
 			job.lastActivityAt = job.currentToolStartedAt;
 			await writeJson(statusPath(jobDir), job);
-			renderAsyncWidget();
+			if (!options.skipWidget) renderAsyncWidget();
 		}
 
 		if (event.type === "tool_execution_end") {
@@ -671,7 +792,7 @@ async function startJob(
 			job.lastUpdate = Date.now();
 			job.lastActivityAt = job.lastUpdate;
 			await writeJson(statusPath(jobDir), job);
-			renderAsyncWidget();
+			if (!options.skipWidget) renderAsyncWidget();
 		}
 
 		if (event.type === "message_end" && event.message) {
@@ -680,7 +801,7 @@ async function startJob(
 			updateUsageFromMessage(job, message);
 			await writeJson(messagesPath, messages);
 			await writeJson(statusPath(jobDir), job);
-			renderAsyncWidget();
+			if (!options.skipWidget) renderAsyncWidget();
 		}
 	};
 
@@ -858,7 +979,9 @@ async function runChainPhase(pi: ExtensionAPI, ctx: ExtensionContext, chainRun: 
 	await writeJson(contextPath, phaseContext);
 	const attempt: ChainAttemptMetadata = { attempt: attemptNo, status: "running", startedAt: new Date().toISOString() };
 	phaseRun.attempts.push(attempt);
+	liveChains.set(chainRun.id, chainRun);
 	await writeJson(chainStatusPath(chainRun.chainDir), chainRun);
+	renderAsyncWidget(ctx);
 	const phasePrompt = phase.prompt.includes("{task}") ? phase.prompt.replaceAll("{task}", chainRun.task) : `${phase.prompt}\n\nOriginal chain task:\n${chainRun.task}`;
 	const failureContext = previousFailureContext(phaseRun);
 	const task = failureContext ? `${phasePrompt}\n\nChain resume context:\n${failureContext}` : phasePrompt;
@@ -875,9 +998,11 @@ async function runChainPhase(pi: ExtensionAPI, ctx: ExtensionContext, chainRun: 
 	attempt.jobId = job.id;
 	attempt.jobDir = job.jobDir;
 	await writeJson(chainStatusPath(chainRun.chainDir), chainRun);
+	renderAsyncWidget(ctx);
 	while (true) {
 		await new Promise((resolve) => setTimeout(resolve, 1000));
 		const latest = readJson<JobMetadata>(statusPath(job.jobDir)) ?? job;
+		renderAsyncWidget(ctx);
 		if (latest.status === "running" || latest.status === "queued" || latest.status === "paused") continue;
 		attempt.finishedAt = new Date().toISOString();
 		if (latest.status !== "complete") {
@@ -888,7 +1013,9 @@ async function runChainPhase(pi: ExtensionAPI, ctx: ExtensionContext, chainRun: 
 			chainRun.failedStageId = phaseRun.stageId;
 			chainRun.failedPhaseId = phaseRun.phaseId;
 			chainRun.errorMessage = attempt.errorMessage;
+			liveChains.set(chainRun.id, chainRun);
 			await writeJson(chainStatusPath(chainRun.chainDir), chainRun);
+			renderAsyncWidget(ctx);
 			return false;
 		}
 		const produced = phaseOutputs(phase).filter((file) => fs.existsSync(chainAttemptOutputPath(attemptDir, file)));
@@ -900,7 +1027,9 @@ async function runChainPhase(pi: ExtensionAPI, ctx: ExtensionContext, chainRun: 
 			chainRun.failedStageId = phaseRun.stageId;
 			chainRun.failedPhaseId = phaseRun.phaseId;
 			chainRun.errorMessage = attempt.errorMessage;
+			liveChains.set(chainRun.id, chainRun);
 			await writeJson(chainStatusPath(chainRun.chainDir), chainRun);
+			renderAsyncWidget(ctx);
 			return false;
 		}
 		for (const file of produced) {
@@ -912,6 +1041,7 @@ async function runChainPhase(pi: ExtensionAPI, ctx: ExtensionContext, chainRun: 
 		phaseRun.status = "complete";
 		phaseRun.outputs = produced;
 		await writeJson(chainStatusPath(chainRun.chainDir), chainRun);
+		renderAsyncWidget(ctx);
 		return true;
 	}
 }
@@ -940,7 +1070,9 @@ async function continueChain(pi: ExtensionAPI, ctx: ExtensionContext, chainRun: 
 	}
 	chainRun.status = "complete";
 	chainRun.finishedAt = new Date().toISOString();
+	liveChains.delete(chainRun.id);
 	await writeJson(chainStatusPath(chainRun.chainDir), chainRun);
+	renderAsyncWidget(ctx);
 }
 
 const ActionSchema = StringEnum(["start", "status", "result", "list", "list-agents", "cancel"] as const, {
@@ -1044,11 +1176,13 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		lastUiContext = ctx;
+		try { ctx.ui.setWidget(LEGACY_WIDGET_KEY, undefined); } catch { /* ignore stale legacy widget */ }
 		renderAsyncWidget(ctx);
 	});
 
-	pi.on("session_shutdown", () => {
+	pi.on("session_shutdown", (_event, ctx) => {
 		stopWidgetRefreshTimer();
+		void clearWidgetStackSection(ctx).catch(() => undefined);
 		lastUiContext = null;
 	});
 
@@ -1089,7 +1223,9 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 				if (!chain) return { content: [{ type: "text", text: `Chain definition not found for resume: ${chainRun.chain}` }], isError: true };
 				chainRun.status = "running";
 				chainRun.errorMessage = undefined;
+				liveChains.set(chainRun.id, chainRun);
 				await writeJson(chainStatusPath(chainDir), chainRun);
+				renderAsyncWidget(ctx);
 				continueChain(pi, ctx, chainRun, chain, chainScope).then(async () => {
 					const latest = readJson<ChainRunMetadata>(chainStatusPath(chainDir)) ?? chainRun;
 					if (latest.status === "failed") {
@@ -1108,7 +1244,9 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 				}).catch(async (error) => {
 					chainRun.status = "failed";
 					chainRun.errorMessage = error instanceof Error ? error.message : String(error);
+					liveChains.set(chainRun.id, chainRun);
 					await writeJson(chainStatusPath(chainDir), chainRun);
+					renderAsyncWidget(ctx);
 				});
 				return { content: [{ type: "text", text: `Resumed chain ${chainRun.id} from failed phase.` }], details: { sessionId, baseDir, chain: chainRun } };
 			}
@@ -1132,9 +1270,12 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 				status: "running",
 				startedAt: new Date().toISOString(),
 				chainFilePath: chain.filePath,
+				stages: chain.stages.map((stage) => ({ id: stage.id, mode: stage.mode, phaseIds: stage.phases.map((phase) => phase.id) })),
 				phases: chain.stages.flatMap((stage) => stage.phases.map((phase) => ({ stageId: stage.id, phaseId: phase.id, agent: phase.agent, status: "pending" as ChainPhaseRunStatus, attempts: [], outputs: [] }))),
 			};
+			liveChains.set(chainRun.id, chainRun);
 			await writeJson(chainStatusPath(chainDir), chainRun);
+			renderAsyncWidget(ctx);
 			continueChain(pi, ctx, chainRun, chain, chainScope).then(async () => {
 				const latest = readJson<ChainRunMetadata>(chainStatusPath(chainDir)) ?? chainRun;
 				if (latest.status === "failed") {
@@ -1153,7 +1294,9 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 			}).catch(async (error) => {
 				chainRun.status = "failed";
 				chainRun.errorMessage = error instanceof Error ? error.message : String(error);
+				liveChains.set(chainRun.id, chainRun);
 				await writeJson(chainStatusPath(chainDir), chainRun);
+				renderAsyncWidget(ctx);
 			});
 			return { content: [{ type: "text", text: [`Started chain ${chain.name} · running`, `Chain: ${chainId}`, `Dir: ${chainDir}`, "", "Use chain status to inspect progress."].join("\n") }], details: { sessionId, baseDir, chain: chainRun } };
 		},
