@@ -1,0 +1,106 @@
+name: tdd-pipeline
+description: Execute a task through context, red, green, refactor, and review phases
+
+stages:
+  - id: context
+    agent: context-builder
+    output: context.md
+    outputMode: file-only
+    prompt: |
+      Architecture & Context Analysis.
+
+      Goal: resolve the implementation surface for the task below and produce a compact handoff for the next phases.
+
+      Task:
+      {task}
+
+      Contract:
+      - Inspect the relevant project files, docs, tests, configuration, and tracker context needed to understand the task.
+      - Identify affected modules, dependencies, entry points, existing patterns, risks, and constraints.
+      - Define a validation contract: expected behavior, acceptance criteria, focused test commands, full validation commands when practical, and any manual checks needed.
+      - Do not modify project/source files.
+
+      Output: call chain_output with sections for task summary, affected surface area, validation contract, assumptions, risks, and recommended next-step guidance for RED.
+
+  - id: red
+    agent: red
+    reads:
+      - context.md
+    output: red.md
+    outputMode: file-only
+    prompt: |
+      RED phase.
+
+      Goal: create the smallest failing tests that specify the required behavior.
+
+      Contract:
+      - Use chain_read to inspect context.md before producing output.
+      - Use the original task: {task}
+      - Write failing tests only. Do not implement production behavior.
+      - Run the smallest relevant test command and prove the new tests fail for the expected reason.
+
+      Output: call chain_output with changed test files, commands run with exit codes, expected failure evidence, and any constraints for GREEN.
+
+  - id: green
+    agent: green
+    reads:
+      - context.md
+      - red.md
+    output: green.md
+    outputMode: file-only
+    progress: true
+    prompt: |
+      GREEN phase.
+
+      Goal: implement the minimum production change needed to pass the RED tests.
+
+      Contract:
+      - Use chain_read for every declared input relevant to the phase before producing output.
+      - Make the smallest safe production change that satisfies the failing tests.
+      - Run the focused test command from RED and confirm green status.
+
+      Output: call chain_output with changed files, implementation summary, commands run with exit codes, validation evidence, surprises/risks, and guidance for REFACTOR.
+
+  - id: refactor
+    agent: worker
+    reads:
+      - context.md
+      - red.md
+      - green.md
+    output: refactor.md
+    outputMode: file-only
+    progress: true
+    prompt: |
+      REFACTOR phase.
+
+      Goal: clean up the green implementation while preserving behavior and tests.
+
+      Contract:
+      - Use chain_read for every declared input relevant to the phase before producing output.
+      - Inspect the current diff directly.
+      - Improve clarity and maintainability without expanding product scope.
+      - Preserve green tests throughout refactoring.
+
+      Output: call chain_output with refactors performed, files changed, commands run with exit codes, validation evidence, remaining risks, and guidance for REVIEW.
+
+  - id: review
+    agent: reviewer
+    reads:
+      - context.md
+      - red.md
+      - green.md
+      - refactor.md
+    output: review.md
+    outputMode: file-only
+    prompt: |
+      QA & Code Review phase.
+
+      Goal: verify the final diff against the task, validation contract, and project standards.
+
+      Contract:
+      - Use chain_read for every declared input relevant to the phase before producing output.
+      - Inspect the actual repository diff and relevant files directly.
+      - Verify tests pass or report exactly what could not be validated.
+      - Check correctness, regressions, scope control, test quality, simplicity, maintainability, and project conventions.
+
+      Output: call chain_output with verdict, validation evidence, findings with file/line references when available, and any deferred follow-ups with durable context.

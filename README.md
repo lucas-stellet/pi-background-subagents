@@ -204,6 +204,65 @@ Cancel a running job:
 
 Cancelled jobs are marked `cancelled` and removed from the live widget and default run lists.
 
+## Chains
+
+Chains are YAML workflows discovered from:
+
+- `~/.pi/agent/chains/*.chain.yaml` (or `.chain.yml`)
+- nearest project `.pi/chains/*.chain.yaml` (or `.chain.yml`) when chain scope includes project chains
+
+Example chain file:
+
+```yaml
+name: review-fix
+description: Investigate and fix reviewer feedback
+stages:
+  - id: inspect
+    agent: scout
+    output: inspect.md
+    prompt: |
+      Review the task and codebase.
+
+      # Findings
+      Summarize blockers for: {task}
+
+  - id: fix
+    agent: coder
+    reads:
+      - inspect.md
+    output: fix.md
+    prompt: |
+      Use the inspection notes and implement the smallest fix.
+```
+
+Stages run sequentially by default. A stage may set `mode: parallel` and contain `phases:`; phases in that stage run concurrently as the current parallel MVP, then later stages can read their declared outputs. Phase prompts may include `{task}`, which is replaced with the original chain task. If omitted, the original task is appended to the phase prompt.
+
+Run or inspect chains with the `chain` tool:
+
+```json
+{ "action": "list", "chainScope": "both" }
+```
+
+```json
+{ "action": "start", "chain": "review-fix", "task": "Fix the reviewer blockers." }
+```
+
+```json
+{ "action": "status", "chainId": "chain-...", "verbose": true }
+```
+
+```json
+{ "action": "result", "chainId": "chain-..." }
+```
+
+Failed chains can be resumed after fixing the cause:
+
+```json
+{ "action": "resume", "chainId": "chain-..." }
+```
+
+Chain outputs are stored under the chain run artifacts directory and must be declared with `output` or `outputs`. Phases that declare `reads` can access prior outputs through the chain tools.
+
 ## Project-local agent confirmation
 
 Project-local agents run without an interactive confirmation by default. To opt back into the trust prompt for a specific call, pass:
@@ -232,8 +291,8 @@ The parent extension reads the JSON event stream, updates `status.json`, stores 
 
 Planned improvements:
 
-- Add true `parallel` mode with grouped status display.
-- Add `chain` mode with `{previous}` handoff support.
+- Improve chain parallel status grouping and live progress display.
+- Add optional chain shortcuts such as `reads: previous` / `reads: all`.
 - Add richer TUI rendering for `renderCall` and `renderResult`.
 - Track recent tool calls and recent output snippets in status files.
 - Add stale-process reconciliation after parent Pi restarts.

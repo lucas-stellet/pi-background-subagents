@@ -24,11 +24,15 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import { type ChainConfig, type ChainPhase, type ChainScope, discoverChains } from "./chains.ts";
 
 const CUSTOM_TYPE = "background-subagents";
 const JOBS_ROOT_NAME = "pi-subagents";
 const RESULT_PREVIEW_CHARS = 20_000;
 const WIDGET_KEY = "subagent-async";
+const CHAIN_JOBS_ROOT_NAME = "pi-chains";
+const READ_TRUNCATE_LINES = 2000;
+const READ_TRUNCATE_BYTES = 50_000;
 
 type JobStatus = "queued" | "running" | "complete" | "failed" | "paused" | "cancelled";
 
@@ -85,6 +89,56 @@ interface JobDetails {
 	messagesPath?: string;
 }
 
+type ChainRunStatus = "running" | "complete" | "failed";
+type ChainPhaseRunStatus = "pending" | "running" | "complete" | "failed";
+
+interface ChainAttemptMetadata {
+	attempt: number;
+	jobId?: string;
+	jobDir?: string;
+	status: ChainPhaseRunStatus;
+	startedAt: string;
+	finishedAt?: string;
+	errorMessage?: string;
+}
+
+interface ChainPhaseRunMetadata {
+	stageId: string;
+	phaseId: string;
+	agent: string;
+	status: ChainPhaseRunStatus;
+	attempts: ChainAttemptMetadata[];
+	outputs: string[];
+}
+
+interface ChainRunMetadata {
+	id: string;
+	sessionId: string;
+	chain: string;
+	chainSource: "user" | "project";
+	task: string;
+	cwd: string;
+	chainDir: string;
+	status: ChainRunStatus;
+	startedAt: string;
+	finishedAt?: string;
+	failedStageId?: string;
+	failedPhaseId?: string;
+	errorMessage?: string;
+	chainFilePath: string;
+	phases: ChainPhaseRunMetadata[];
+}
+
+interface ChainPhaseContext {
+	chainId: string;
+	chainDir: string;
+	phaseId: string;
+	attemptDir: string;
+	allowedReads: string[];
+	allowedOutputs: string[];
+	defaultOutput?: string;
+}
+
 const runningJobs = new Map<string, ChildProcessWithoutNullStreams>();
 const cancelledJobs = new Set<string>();
 const liveJobs = new Map<string, JobMetadata>();
@@ -109,6 +163,27 @@ function getSessionId(ctx: ExtensionContext): string {
 
 function getBaseDir(sessionId: string): string {
 	return path.join(os.tmpdir(), JOBS_ROOT_NAME, sessionId);
+}
+
+function getChainBaseDir(sessionId: string): string {
+	return path.join(os.tmpdir(), CHAIN_JOBS_ROOT_NAME, sessionId);
+}
+
+function chainStatusPath(chainDir: string): string {
+	return path.join(chainDir, "status.json");
+}
+
+function chainOutputsDir(chainDir: string): string {
+	return path.join(chainDir, "outputs");
+}
+
+function chainAttemptOutputPath(attemptDir: string, filename: string): string {
+	return path.join(attemptDir, `output-${safeName(filename)}`);
+}
+
+function isPathInside(parentDir: string, candidatePath: string): boolean {
+	const relativePath = path.relative(path.resolve(parentDir), path.resolve(candidatePath));
+	return relativePath === "" || (!relativePath.startsWith("..") && !path.isAbsolute(relativePath));
 }
 
 function findNearestProjectSettingsPath(cwd: string): string | null {
@@ -476,13 +551,21 @@ function renderAsyncWidget(ctx: ExtensionContext | null = lastUiContext): void {
 	try { ctx.ui.setWidget(WIDGET_KEY, lines); } catch { /* ignore stale UI */ }
 }
 
+interface StartJobOptions {
+	cwd?: string;
+	tools?: string[];
+	promptPrefix?: string;
+	env?: Record<string, string>;
+}
+
 async function startJob(
 	pi: ExtensionAPI,
 	ctx: ExtensionContext,
 	agent: AgentConfig,
 	task: string,
-	cwd?: string,
+	cwdOrOptions?: string | StartJobOptions,
 ): Promise<JobMetadata> {
+	const options: StartJobOptions = typeof cwdOrOptions === "string" ? { cwd: cwdOrOptions } : (cwdOrOptions ?? {});
 	const sessionId = getSessionId(ctx);
 	const baseDir = getBaseDir(sessionId);
 	const jobId = `subagent-${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}-${randomUUID().slice(0, 8)}`;
@@ -497,7 +580,7 @@ async function startJob(
 		agent: agent.name,
 		agentSource: agent.source,
 		task,
-		cwd: cwd ?? ctx.cwd,
+		cwd: options.cwd ?? ctx.cwd,
 		jobDir,
 		status: "running",
 		startedAt: new Date(now).toISOString(),
@@ -523,9 +606,11 @@ async function startJob(
 	if (initialModel.model) args.push("--model", initialModel.model);
 	if (!agent.inheritProjectContext) args.push("--no-context-files");
 	if (!agent.inheritSkills) args.push("--no-skills");
-	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
+	const tools = options.tools ?? agent.tools;
+	if (tools && tools.length > 0) args.push("--tools", tools.join(","));
 
-	const promptPath = await writePromptToTempFile(jobDir, agent.name, agent.systemPrompt);
+	const systemPrompt = options.promptPrefix ? `${options.promptPrefix}\n\n${agent.systemPrompt}` : agent.systemPrompt;
+	const promptPath = await writePromptToTempFile(jobDir, agent.name, systemPrompt);
 	if (promptPath) args.push(agent.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt", promptPath);
 	args.push(`Task: ${task}`);
 
@@ -534,6 +619,7 @@ async function startJob(
 		cwd: job.cwd,
 		shell: false,
 		stdio: ["ignore", "pipe", "pipe"],
+		env: { ...process.env, ...(options.env ?? {}) },
 	});
 	job.pid = proc.pid;
 	await writeJson(statusPath(jobDir), job);
@@ -667,6 +753,183 @@ async function startJob(
 	return job;
 }
 
+function phaseOutputs(phase: ChainPhase): string[] {
+	return phase.outputs ?? (phase.output ? [phase.output] : []);
+}
+
+function chainPhaseKey(stageId: string, phaseId: string): string {
+	return `${stageId}/${phaseId}`;
+}
+
+function buildChainPromptPrefix(phase: ChainPhase): string {
+	const reads = phase.reads.length ? phase.reads.map((r) => `- ${r}`).join("\n") : "- (none)";
+	const outputs = phaseOutputs(phase).map((o) => `- ${o}`).join("\n");
+	return [
+		"Chain input contract",
+		"",
+		"The following handoff files are part of your phase contract.",
+		"Do not assume their contents from filenames alone.",
+		"Use chain_read({ filename }) to inspect every file relevant to your phase before producing output.",
+		"",
+		"Allowed inputs:",
+		reads,
+		"",
+		"Chain output contract",
+		"",
+		"You must produce the required phase output using chain_output.",
+		"Do not write handoff files directly.",
+		"",
+		"Allowed outputs:",
+		outputs || "- (none)",
+	].join("\n");
+}
+
+function formatChainList(chains: ChainConfig[]): string {
+	if (chains.length === 0) return "No chains found.";
+	return [`Available chains: ${chains.length}`, "", ...chains.map((chain) => `- ${chain.name} · ${chain.source}\n  ${chain.description || "(no description)"}\n  File: ${chain.filePath}`)].join("\n");
+}
+
+function formatChainRunStatus(chain: ChainRunMetadata, verbose = false): string {
+	const lines = [`${chain.chain} · ${chain.status}`, `Chain: ${chain.id}`, `Started: ${chain.startedAt}`];
+	if (chain.finishedAt) lines.push(`Finished: ${chain.finishedAt}`);
+	if (chain.errorMessage) lines.push(`Error: ${chain.errorMessage}`);
+	lines.push("", "Phases:");
+	for (const phase of chain.phases) {
+		lines.push(`- ${phase.stageId}/${phase.phaseId} · ${phase.status} · attempts ${phase.attempts.length}${phase.outputs.length ? ` · outputs ${phase.outputs.join(", ")}` : ""}`);
+		if (verbose) for (const attempt of phase.attempts) lines.push(`  - attempt ${attempt.attempt}: ${attempt.status}${attempt.jobId ? ` job=${attempt.jobId}` : ""}${attempt.errorMessage ? ` error=${attempt.errorMessage}` : ""}`);
+	}
+	if (verbose) lines.push("", `Dir: ${chain.chainDir}`, `Outputs: ${chainOutputsDir(chain.chainDir)}`);
+	return lines.join("\n");
+}
+
+function resolveChainTools(agent: AgentConfig, phase: ChainPhase): string[] | undefined {
+	// No explicit allowlist: do not pass --tools. This preserves Pi's default
+	// tools for agents without frontmatter tools and still exposes registered
+	// extension tools such as chain_read/chain_output.
+	if (!agent.tools?.length && !phase.tools?.length) return undefined;
+
+	// If the chain phase declares tools, treat it as an additional restriction.
+	// When the agent has its own allowlist, never elevate beyond that allowlist.
+	const normalTools = phase.tools?.length
+		? (agent.tools?.length ? agent.tools.filter((tool) => phase.tools?.includes(tool)) : [...phase.tools])
+		: [...(agent.tools ?? [])];
+	const tools = [...normalTools];
+	if (phase.reads.length && !tools.includes("chain_read")) tools.push("chain_read");
+	if (phaseOutputs(phase).length && !tools.includes("chain_output")) tools.push("chain_output");
+	return tools.length ? tools : undefined;
+}
+
+function previousFailureContext(phaseRun: ChainPhaseRunMetadata): string {
+	const failed = [...phaseRun.attempts].reverse().find((attempt) => attempt.status === "failed");
+	if (!failed) return "";
+	const lines = [
+		"Previous chain phase attempt failed.",
+		`Attempt: ${failed.attempt}`,
+		failed.errorMessage ? `Error: ${failed.errorMessage}` : undefined,
+		failed.jobDir ? `Previous attempt artifacts: ${failed.jobDir}` : undefined,
+	].filter((line): line is string => Boolean(line));
+	return lines.join("\n");
+}
+
+async function runChainPhase(pi: ExtensionAPI, ctx: ExtensionContext, chainRun: ChainRunMetadata, phaseRun: ChainPhaseRunMetadata, phase: ChainPhase, agent: AgentConfig): Promise<boolean> {
+	phaseRun.status = "running";
+	const attemptNo = phaseRun.attempts.length + 1;
+	const attemptDir = path.join(chainRun.chainDir, "phases", safeName(phaseRun.phaseId), `attempt-${attemptNo}`);
+	await fs.promises.mkdir(attemptDir, { recursive: true });
+	const phaseContext: ChainPhaseContext = {
+		chainId: chainRun.id,
+		chainDir: chainRun.chainDir,
+		phaseId: phaseRun.phaseId,
+		attemptDir,
+		allowedReads: phase.reads,
+		allowedOutputs: phaseOutputs(phase),
+		defaultOutput: phase.output,
+	};
+	const contextPath = path.join(attemptDir, "chain-phase-context.json");
+	await writeJson(contextPath, phaseContext);
+	const attempt: ChainAttemptMetadata = { attempt: attemptNo, status: "running", startedAt: new Date().toISOString() };
+	phaseRun.attempts.push(attempt);
+	await writeJson(chainStatusPath(chainRun.chainDir), chainRun);
+	const phasePrompt = phase.prompt.includes("{task}") ? phase.prompt.replaceAll("{task}", chainRun.task) : `${phase.prompt}\n\nOriginal chain task:\n${chainRun.task}`;
+	const failureContext = previousFailureContext(phaseRun);
+	const task = failureContext ? `${phasePrompt}\n\nChain resume context:\n${failureContext}` : phasePrompt;
+	const job = await startJob(pi, ctx, agent, task, {
+		cwd: chainRun.cwd,
+		tools: resolveChainTools(agent, phase),
+		promptPrefix: buildChainPromptPrefix(phase),
+		env: { CHAIN_PHASE_CONTEXT: contextPath },
+	});
+	attempt.jobId = job.id;
+	attempt.jobDir = job.jobDir;
+	await writeJson(chainStatusPath(chainRun.chainDir), chainRun);
+	while (true) {
+		await new Promise((resolve) => setTimeout(resolve, 1000));
+		const latest = readJson<JobMetadata>(statusPath(job.jobDir)) ?? job;
+		if (latest.status === "running" || latest.status === "queued" || latest.status === "paused") continue;
+		attempt.finishedAt = new Date().toISOString();
+		if (latest.status !== "complete") {
+			attempt.status = "failed";
+			attempt.errorMessage = latest.errorMessage ?? `job ${latest.status}`;
+			phaseRun.status = "failed";
+			chainRun.status = "failed";
+			chainRun.failedStageId = phaseRun.stageId;
+			chainRun.failedPhaseId = phaseRun.phaseId;
+			chainRun.errorMessage = attempt.errorMessage;
+			await writeJson(chainStatusPath(chainRun.chainDir), chainRun);
+			return false;
+		}
+		const produced = phaseOutputs(phase).filter((file) => fs.existsSync(chainAttemptOutputPath(attemptDir, file)));
+		if (produced.length !== phaseOutputs(phase).length) {
+			attempt.status = "failed";
+			attempt.errorMessage = `missing chain_output for ${phaseOutputs(phase).filter((file) => !produced.includes(file)).join(", ")}`;
+			phaseRun.status = "failed";
+			chainRun.status = "failed";
+			chainRun.failedStageId = phaseRun.stageId;
+			chainRun.failedPhaseId = phaseRun.phaseId;
+			chainRun.errorMessage = attempt.errorMessage;
+			await writeJson(chainStatusPath(chainRun.chainDir), chainRun);
+			return false;
+		}
+		for (const file of produced) {
+			const outputPath = path.join(chainOutputsDir(chainRun.chainDir), file);
+			await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
+			await fs.promises.copyFile(chainAttemptOutputPath(attemptDir, file), outputPath);
+		}
+		attempt.status = "complete";
+		phaseRun.status = "complete";
+		phaseRun.outputs = produced;
+		await writeJson(chainStatusPath(chainRun.chainDir), chainRun);
+		return true;
+	}
+}
+
+async function continueChain(pi: ExtensionAPI, ctx: ExtensionContext, chainRun: ChainRunMetadata, chain: ChainConfig, agentScope: AgentScope): Promise<void> {
+	const agents = discoverAgents(chainRun.cwd, agentScope).agents;
+	const phaseMap = new Map(chainRun.phases.map((p) => [chainPhaseKey(p.stageId, p.phaseId), p]));
+	for (const stage of chain.stages) {
+		const pending = stage.phases.map((phase) => ({ phase, run: phaseMap.get(chainPhaseKey(stage.id, phase.id))! })).filter(({ run }) => run.status !== "complete");
+		if (pending.length === 0) continue;
+		if (stage.mode === "parallel") {
+			const results = await Promise.all(pending.map(async ({ phase, run }) => {
+				const agent = agents.find((a) => a.name === phase.agent);
+				if (!agent) throw new Error(`Unknown agent ${phase.agent}`);
+				return runChainPhase(pi, ctx, chainRun, run, phase, agent);
+			}));
+			if (results.some((ok) => !ok)) return;
+		} else {
+			for (const { phase, run } of pending) {
+				const agent = agents.find((a) => a.name === phase.agent);
+				if (!agent) throw new Error(`Unknown agent ${phase.agent}`);
+				const ok = await runChainPhase(pi, ctx, chainRun, run, phase, agent);
+				if (!ok) return;
+			}
+		}
+	}
+	chainRun.status = "complete";
+	chainRun.finishedAt = new Date().toISOString();
+	await writeJson(chainStatusPath(chainRun.chainDir), chainRun);
+}
+
 const ActionSchema = StringEnum(["start", "status", "result", "list", "list-agents", "cancel"] as const, {
 	description: 'Action to perform. start launches one background agent; list-agents shows available agents including prompt mode, project-context inheritance, skills inheritance, and tools; status/result/cancel inspect a job; list shows prior runs. Default is "start" when agent and task are provided.',
 	default: "start",
@@ -675,6 +938,30 @@ const ActionSchema = StringEnum(["start", "status", "result", "list", "list-agen
 const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 	description: `Which agent directories to use. Default: "user" (${path.join(getAgentDir(), "agents")}). Use "both" to include project-local agents from ${CONFIG_DIR_NAME}/agents.`,
 	default: "user",
+});
+
+const ChainActionSchema = StringEnum(["list", "start", "status", "result", "resume"] as const, { default: "list" });
+const ChainScopeSchema = StringEnum(["user", "project", "both"] as const, { default: "user" });
+
+const ChainParams = Type.Object({
+	action: Type.Optional(ChainActionSchema),
+	chain: Type.Optional(Type.String({ description: "Chain name for start action" })),
+	task: Type.Optional(Type.String({ description: "Task for start action" })),
+	chainId: Type.Optional(Type.String({ description: "Chain run id for status/result/resume" })),
+	chainScope: Type.Optional(ChainScopeSchema),
+	cwd: Type.Optional(Type.String({ description: "Working directory for the chain" })),
+	verbose: Type.Optional(Type.Boolean({ default: false })),
+});
+
+const ChainReadParams = Type.Object({
+	filename: Type.String({ description: "Declared chain handoff filename to read" }),
+	offset: Type.Optional(Type.Number({ description: "Line number to start reading from (1-indexed)" })),
+	limit: Type.Optional(Type.Number({ description: "Maximum number of lines to read" })),
+});
+
+const ChainOutputParams = Type.Object({
+	filename: Type.Optional(Type.String({ description: "Output filename; required when the phase declares multiple outputs" })),
+	content: Type.String({ description: "Output content to persist as the phase handoff" }),
 });
 
 const SubagentParams = Type.Object({
@@ -695,6 +982,53 @@ export default function (pi: ExtensionAPI) {
 }
 
 export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
+	pi.registerTool({
+		name: "chain_read",
+		label: "chain_read",
+		description: "Read a declared chain handoff file for the current chain phase. Supports offset/limit like read. Only works inside a chain phase.",
+		parameters: ChainReadParams,
+		async execute(_toolCallId, params) {
+			const contextPath = process.env.CHAIN_PHASE_CONTEXT;
+			if (!contextPath) return { content: [{ type: "text", text: "chain_read is only available inside a chain phase." }], isError: true };
+			const phaseContext = readJson<ChainPhaseContext>(contextPath);
+			if (!phaseContext) return { content: [{ type: "text", text: "Invalid chain phase context." }], isError: true };
+			if (!phaseContext.allowedReads.includes(params.filename)) return { content: [{ type: "text", text: `Read not allowed by this phase: ${params.filename}` }], isError: true };
+			const outputsDir = chainOutputsDir(phaseContext.chainDir);
+			const filePath = path.join(outputsDir, params.filename);
+			if (!isPathInside(outputsDir, filePath)) return { content: [{ type: "text", text: "Invalid chain read path." }], isError: true };
+			let content: string;
+			try { content = fs.readFileSync(filePath, "utf-8"); } catch { return { content: [{ type: "text", text: `Chain input not found: ${params.filename}` }], isError: true }; }
+			const lines = content.split("\n");
+			const start = params.offset ? Math.max(0, params.offset - 1) : 0;
+			const limit = params.limit ?? READ_TRUNCATE_LINES;
+			let selected = lines.slice(start, start + limit).join("\n");
+			let truncated = start + limit < lines.length;
+			if (selected.length > READ_TRUNCATE_BYTES) { selected = selected.slice(0, READ_TRUNCATE_BYTES); truncated = true; }
+			if (truncated) selected += `\n\n[chain_read truncated. Continue with offset=${start + limit + 1}.]`;
+			return { content: [{ type: "text", text: selected }], details: { filename: params.filename, offset: params.offset, limit } };
+		},
+	});
+
+	pi.registerTool({
+		name: "chain_output",
+		label: "chain_output",
+		description: "Persist the official output for the current chain phase. Only works inside a chain phase and validates allowed outputs.",
+		parameters: ChainOutputParams,
+		async execute(_toolCallId, params) {
+			const contextPath = process.env.CHAIN_PHASE_CONTEXT;
+			if (!contextPath) return { content: [{ type: "text", text: "chain_output is only available inside a chain phase." }], isError: true };
+			const phaseContext = readJson<ChainPhaseContext>(contextPath);
+			if (!phaseContext) return { content: [{ type: "text", text: "Invalid chain phase context." }], isError: true };
+			const filename = params.filename ?? phaseContext.defaultOutput;
+			if (!filename) return { content: [{ type: "text", text: "filename is required for this phase." }], isError: true };
+			if (!phaseContext.allowedOutputs.includes(filename)) return { content: [{ type: "text", text: `Output not allowed by this phase: ${filename}` }], isError: true };
+			const outputPath = chainAttemptOutputPath(phaseContext.attemptDir, filename);
+			await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
+			await fs.promises.writeFile(outputPath, params.content, "utf-8");
+			return { content: [{ type: "text", text: `chain output saved: ${filename}` }], details: { filename, outputPath } };
+		},
+	});
+
 	pi.on("session_start", (_event, ctx) => {
 		lastUiContext = ctx;
 		renderAsyncWidget(ctx);
@@ -703,6 +1037,113 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 	pi.on("session_shutdown", () => {
 		stopWidgetRefreshTimer();
 		lastUiContext = null;
+	});
+
+	pi.registerTool({
+		name: "chain",
+		label: "Chain",
+		description: "List, start, inspect, and resume YAML-defined chains of background subagents.",
+		promptSnippet: "Run a chain of subagents with explicit handoffs",
+		parameters: ChainParams,
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			lastUiContext = ctx;
+			const sessionId = getSessionId(ctx);
+			const baseDir = getChainBaseDir(sessionId);
+			const action = params.action ?? "list";
+			const chainScope: ChainScope = params.chainScope ?? "user";
+
+			if (action === "list") {
+				const discovery = discoverChains(params.cwd ?? ctx.cwd, chainScope);
+				return { content: [{ type: "text", text: formatChainList(discovery.chains) }], details: { sessionId, baseDir, chains: discovery.chains, projectChainsDir: discovery.projectChainsDir } };
+			}
+
+			if (action === "status" || action === "result" || action === "resume") {
+				if (!params.chainId) return { content: [{ type: "text", text: `chainId is required for action "${action}".` }], isError: true, details: { sessionId, baseDir } };
+				const chainDir = path.join(baseDir, safeName(params.chainId));
+				const chainRun = readJson<ChainRunMetadata>(chainStatusPath(chainDir));
+				if (!chainRun) return { content: [{ type: "text", text: `Chain not found in this session: ${params.chainId}` }], isError: true, details: { sessionId, baseDir } };
+				if (action === "status") return { content: [{ type: "text", text: formatChainRunStatus(chainRun, params.verbose ?? false) }], details: { sessionId, baseDir, chain: chainRun } };
+				if (action === "result") {
+					const outputs: Record<string, string> = {};
+					for (const phase of chainRun.phases) for (const output of phase.outputs) {
+						try { outputs[output] = fs.readFileSync(path.join(chainOutputsDir(chainDir), output), "utf-8"); } catch { /* ignore */ }
+					}
+					const text = Object.entries(outputs).map(([file, content]) => `# ${file}\n\n${content}`).join("\n\n---\n\n") || "(no chain outputs found)";
+					return { content: [{ type: "text", text }], details: { sessionId, baseDir, chain: chainRun, outputs } };
+				}
+				const discovery = discoverChains(chainRun.cwd, chainScope);
+				const chain = discovery.chains.find((c) => c.name === chainRun.chain);
+				if (!chain) return { content: [{ type: "text", text: `Chain definition not found for resume: ${chainRun.chain}` }], isError: true };
+				chainRun.status = "running";
+				chainRun.errorMessage = undefined;
+				await writeJson(chainStatusPath(chainDir), chainRun);
+				continueChain(pi, ctx, chainRun, chain, chainScope).then(async () => {
+					const latest = readJson<ChainRunMetadata>(chainStatusPath(chainDir)) ?? chainRun;
+					if (latest.status === "failed") {
+						const failedPhase = latest.phases.find((phase) => phase.stageId === latest.failedStageId && phase.phaseId === latest.failedPhaseId);
+						const attempt = failedPhase?.attempts.at(-1);
+						await pi.sendUserMessage([
+							`Chain failed at phase ${latest.failedStageId}/${latest.failedPhaseId}`,
+							`Chain: ${latest.chain}`,
+							`Chain ID: ${latest.id}`,
+							failedPhase ? `Agent: ${failedPhase.agent}` : undefined,
+							attempt ? `Attempt: ${attempt.attempt}` : undefined,
+							`Error: ${latest.errorMessage ?? "unknown"}`,
+							`Resume with: chain({ action: "resume", chainId: "${latest.id}" })`,
+						].filter((line): line is string => Boolean(line)).join("\n"), { deliverAs: "followUp" });
+					}
+				}).catch(async (error) => {
+					chainRun.status = "failed";
+					chainRun.errorMessage = error instanceof Error ? error.message : String(error);
+					await writeJson(chainStatusPath(chainDir), chainRun);
+				});
+				return { content: [{ type: "text", text: `Resumed chain ${chainRun.id} from failed phase.` }], details: { sessionId, baseDir, chain: chainRun } };
+			}
+
+			if (!params.chain || !params.task) return { content: [{ type: "text", text: "chain and task are required for action \"start\"." }], isError: true, details: { sessionId, baseDir } };
+			const chainCwd = params.cwd ?? ctx.cwd;
+			const discovery = discoverChains(chainCwd, chainScope);
+			const chain = discovery.chains.find((c) => c.name === params.chain);
+			if (!chain) return { content: [{ type: "text", text: `Unknown chain: ${params.chain}` }], isError: true, details: { sessionId, baseDir, chains: discovery.chains } };
+			const chainId = `chain-${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}-${randomUUID().slice(0, 8)}`;
+			const chainDir = path.join(baseDir, chainId);
+			await fs.promises.mkdir(chainOutputsDir(chainDir), { recursive: true });
+			const chainRun: ChainRunMetadata = {
+				id: chainId,
+				sessionId,
+				chain: chain.name,
+				chainSource: chain.source,
+				task: params.task,
+				cwd: chainCwd,
+				chainDir,
+				status: "running",
+				startedAt: new Date().toISOString(),
+				chainFilePath: chain.filePath,
+				phases: chain.stages.flatMap((stage) => stage.phases.map((phase) => ({ stageId: stage.id, phaseId: phase.id, agent: phase.agent, status: "pending" as ChainPhaseRunStatus, attempts: [], outputs: [] }))),
+			};
+			await writeJson(chainStatusPath(chainDir), chainRun);
+			continueChain(pi, ctx, chainRun, chain, chainScope).then(async () => {
+				const latest = readJson<ChainRunMetadata>(chainStatusPath(chainDir)) ?? chainRun;
+				if (latest.status === "failed") {
+					const failedPhase = latest.phases.find((phase) => phase.stageId === latest.failedStageId && phase.phaseId === latest.failedPhaseId);
+					const attempt = failedPhase?.attempts.at(-1);
+					await pi.sendUserMessage([
+						`Chain failed at phase ${latest.failedStageId}/${latest.failedPhaseId}`,
+						`Chain: ${latest.chain}`,
+						`Chain ID: ${latest.id}`,
+						failedPhase ? `Agent: ${failedPhase.agent}` : undefined,
+						attempt ? `Attempt: ${attempt.attempt}` : undefined,
+						`Error: ${latest.errorMessage ?? "unknown"}`,
+						`Resume with: chain({ action: "resume", chainId: "${latest.id}" })`,
+					].filter((line): line is string => Boolean(line)).join("\n"), { deliverAs: "followUp" });
+				}
+			}).catch(async (error) => {
+				chainRun.status = "failed";
+				chainRun.errorMessage = error instanceof Error ? error.message : String(error);
+				await writeJson(chainStatusPath(chainDir), chainRun);
+			});
+			return { content: [{ type: "text", text: [`Started chain ${chain.name} · running`, `Chain: ${chainId}`, `Dir: ${chainDir}`, "", "Use chain status to inspect progress."].join("\n") }], details: { sessionId, baseDir, chain: chainRun } };
+		},
 	});
 
 	pi.registerTool({
