@@ -1101,7 +1101,11 @@ async function continueChain(pi: ExtensionAPI, ctx: ExtensionContext, chainRun: 
 	liveChains.delete(chainRun.id);
 	await writeJson(chainStatusPath(chainRun.chainDir), chainRun);
 	renderAsyncWidget(ctx);
-	await pi.sendUserMessage(`Chain complete: ${chainRun.chain}. Use chain({ action: "result", chainId: "${chainRun.id}" }) to read the outputs.`, { deliverAs: "followUp" });
+	await pi.sendUserMessage([
+		`Chain complete: ${chainRun.chain}.`,
+		`Outputs: ${chainOutputsDir(chainRun.chainDir)}`,
+		`Use chain({ action: "result", chainId: "${chainRun.id}" }) to read the outputs.`,
+	].join("\n"), { deliverAs: "followUp" });
 }
 
 const ActionSchema = StringEnum(["start", "status", "result", "list", "list-agents", "cancel"] as const, {
@@ -1270,6 +1274,7 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 							`Chain failed at phase ${latest.failedStageId}/${latest.failedPhaseId}`,
 							`Chain: ${latest.chain}`,
 							`Chain ID: ${latest.id}`,
+							`Outputs: ${chainOutputsDir(latest.chainDir)}`,
 							failedPhase ? `Agent: ${failedPhase.agent}` : undefined,
 							attempt ? `Attempt: ${attempt.attempt}` : undefined,
 							`Error: ${latest.errorMessage ?? "unknown"}`,
@@ -1320,6 +1325,7 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 						`Chain failed at phase ${latest.failedStageId}/${latest.failedPhaseId}`,
 						`Chain: ${latest.chain}`,
 						`Chain ID: ${latest.id}`,
+						`Outputs: ${chainOutputsDir(latest.chainDir)}`,
 						failedPhase ? `Agent: ${failedPhase.agent}` : undefined,
 						attempt ? `Attempt: ${attempt.attempt}` : undefined,
 						`Error: ${latest.errorMessage ?? "unknown"}`,
@@ -1333,7 +1339,7 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 				await writeJson(chainStatusPath(chainDir), chainRun);
 				renderAsyncWidget(ctx);
 			});
-			return { content: [{ type: "text", text: [`Started chain ${chain.name} · running`, `Chain: ${chainId}`, `Dir: ${chainDir}`, "", "No polling needed: the chain will send concise follow-up messages for phase transitions, failure, and completion."].join("\n") }], details: { sessionId, baseDir, chain: chainRun } };
+			return { content: [{ type: "text", text: [`Started chain ${chain.name} · running`, `Chain: ${chainId}`, `Dir: ${chainDir}`, `Outputs: ${chainOutputsDir(chainDir)}`, "", "No polling needed: the chain will send concise follow-up messages for phase transitions, failure, and completion."].join("\n") }], details: { sessionId, baseDir, chain: chainRun } };
 		},
 	});
 
