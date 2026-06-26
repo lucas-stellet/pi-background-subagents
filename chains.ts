@@ -9,6 +9,7 @@ export type ChainMode = "sequential" | "parallel";
 export interface ChainPhase {
 	id: string;
 	agent: string;
+	model: string;
 	reads: string[];
 	output?: string;
 	outputs?: string[];
@@ -95,7 +96,7 @@ function readKeyValue(line: string): { key: string; value: string } | null {
 
 function parsePhase(lines: Line[], index: number, itemIndent: number, inheritedReads: string[] = []): { phase: ChainPhase; index: number } {
 	const first = lines[index].text.slice(2);
-	const phase: ChainPhase = { id: "", agent: "", reads: [...inheritedReads], prompt: "" };
+	const phase: ChainPhase = { id: "", agent: "", model: "", reads: [...inheritedReads], prompt: "" };
 	if (first) {
 		const kv = readKeyValue(first);
 		if (kv) (phase as any)[kv.key] = parseScalar(kv.value);
@@ -119,6 +120,7 @@ function parsePhase(lines: Line[], index: number, itemIndent: number, inheritedR
 	}
 	phase.id = String(phase.id || phase.agent);
 	phase.agent = String(phase.agent || phase.id);
+	phase.model = String((phase as any).model || "");
 	phase.reads = Array.from(new Set([...(inheritedReads ?? []), ...normalizeList((phase as any).reads)]));
 	phase.tools = (phase as any).tools ? normalizeList((phase as any).tools) : undefined;
 	phase.outputs = (phase as any).outputs ? normalizeList((phase as any).outputs) : undefined;
@@ -177,6 +179,7 @@ function parseStages(lines: Line[], index: number, parentIndent: number): { stag
 			stage.phases.push({
 				id: stage.id,
 				agent: String((stage as any).agent || stage.id),
+				model: String((stage as any).model || ""),
 				reads: stage.reads,
 				output: (stage as any).output ? String((stage as any).output) : undefined,
 				outputs: (stage as any).outputs ? normalizeList((stage as any).outputs) : undefined,
@@ -194,6 +197,7 @@ function parseStages(lines: Line[], index: number, parentIndent: number): { stag
 function validatePhase(phase: ChainPhase, filePath: string): void {
 	if (!phase.id) throw new Error(`Chain phase missing id in ${filePath}`);
 	if (!phase.agent) throw new Error(`Chain phase ${phase.id} missing agent in ${filePath}`);
+	if (!phase.model) throw new Error(`Chain phase ${phase.id} must declare model in ${filePath}. Add model: provider/model to the phase.`);
 	const outputs = phase.outputs ?? (phase.output ? [phase.output] : []);
 	if (outputs.length === 0) throw new Error(`Chain phase ${phase.id} must declare output or outputs in ${filePath}`);
 	for (const output of outputs) {

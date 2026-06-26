@@ -4,6 +4,7 @@ description: Build context once, then run independent review agents in parallel,
 stages:
   - id: context
     agent: context-builder
+    model: openai-codex/gpt-5.5
     output: context.md
     outputMode: file-only
     prompt: |
@@ -26,6 +27,7 @@ stages:
     phases:
       - id: code-review
         agent: reviewer
+        model: anthropic/claude-opus-4-8
         output: code-review.md
         outputMode: file-only
         prompt: |
@@ -41,6 +43,7 @@ stages:
 
       - id: decision-review
         agent: oracle
+        model: openai-codex/gpt-5.5
         output: decision-review.md
         outputMode: file-only
         prompt: |
@@ -56,6 +59,7 @@ stages:
 
       - id: test-review
         agent: red
+        model: openai-codex/gpt-5.5
         output: test-review.md
         outputMode: file-only
         prompt: |
@@ -71,6 +75,7 @@ stages:
 
   - id: summarize
     agent: worker
+    model: openai-codex/gpt-5.5
     reads:
       - context.md
       - code-review.md

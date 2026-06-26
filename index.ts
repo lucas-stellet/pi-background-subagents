@@ -556,6 +556,10 @@ interface StartJobOptions {
 	tools?: string[];
 	promptPrefix?: string;
 	env?: Record<string, string>;
+	model?: string;
+	notifyOnFinish?: boolean;
+	sessionId?: string;
+	skipWidget?: boolean;
 }
 
 async function startJob(
@@ -566,14 +570,16 @@ async function startJob(
 	cwdOrOptions?: string | StartJobOptions,
 ): Promise<JobMetadata> {
 	const options: StartJobOptions = typeof cwdOrOptions === "string" ? { cwd: cwdOrOptions } : (cwdOrOptions ?? {});
-	const sessionId = getSessionId(ctx);
+	const sessionId = options.sessionId ?? getSessionId(ctx);
 	const baseDir = getBaseDir(sessionId);
 	const jobId = `subagent-${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}-${randomUUID().slice(0, 8)}`;
 	const jobDir = path.join(baseDir, jobId);
 	await fs.promises.mkdir(jobDir, { recursive: true });
 
 	const now = Date.now();
-	const initialModel = resolveInitialModel(ctx, agent);
+	const initialModel = options.model
+		? { model: options.model, provider: inferProvider(options.model), source: "agent" as JobMetadata["modelSource"] }
+		: resolveInitialModel(ctx, agent);
 	const job: JobMetadata = {
 		id: jobId,
 		sessionId,
@@ -625,7 +631,7 @@ async function startJob(
 	await writeJson(statusPath(jobDir), job);
 	runningJobs.set(jobId, proc);
 	liveJobs.set(jobId, job);
-	renderAsyncWidget(ctx);
+	if (!options.skipWidget) renderAsyncWidget(ctx);
 
 	const stdoutPath = path.join(jobDir, "stdout.jsonl");
 	const stderrPath = path.join(jobDir, "stderr.log");
@@ -721,10 +727,13 @@ async function startJob(
 		if (!job.errorMessage && stderr.trim() && job.status === "failed") job.errorMessage = stderr.trim().slice(0, 4000);
 		await writeJson(statusPath(jobDir), job);
 		if (job.status === "complete" || job.status === "cancelled") liveJobs.delete(jobId);
-		renderAsyncWidget();
-		if (activeWidgetJobs().length === 0) stopWidgetRefreshTimer();
+		if (!options.skipWidget) {
+			renderAsyncWidget();
+			if (activeWidgetJobs().length === 0) stopWidgetRefreshTimer();
+		}
 
 		const preview = finalOutput.length > RESULT_PREVIEW_CHARS ? `${finalOutput.slice(0, RESULT_PREVIEW_CHARS)}\n\n[truncated preview]` : finalOutput;
+		if (options.notifyOnFinish === false) return;
 		try {
 			const elapsed = job.finishedAt ? Date.parse(job.finishedAt) - Date.parse(job.startedAt) : 0;
 			const totalTokens = job.usage.input + job.usage.output;
@@ -857,7 +866,11 @@ async function runChainPhase(pi: ExtensionAPI, ctx: ExtensionContext, chainRun: 
 		cwd: chainRun.cwd,
 		tools: resolveChainTools(agent, phase),
 		promptPrefix: buildChainPromptPrefix(phase),
+		model: phase.model,
 		env: { CHAIN_PHASE_CONTEXT: contextPath },
+		notifyOnFinish: false,
+		sessionId: chainRun.sessionId,
+		skipWidget: true,
 	});
 	attempt.jobId = job.id;
 	attempt.jobDir = job.jobDir;

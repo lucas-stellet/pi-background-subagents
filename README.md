@@ -219,6 +219,7 @@ description: Investigate and fix reviewer feedback
 stages:
   - id: inspect
     agent: scout
+    model: deepseek/deepseek-v4-flash
     output: inspect.md
     prompt: |
       Review the task and codebase.
@@ -228,6 +229,7 @@ stages:
 
   - id: fix
     agent: coder
+    model: openai-codex/gpt-5.5
     reads:
       - inspect.md
     output: fix.md
@@ -235,7 +237,7 @@ stages:
       Use the inspection notes and implement the smallest fix.
 ```
 
-Stages run sequentially by default. A stage may set `mode: parallel` and contain `phases:`; phases in that stage run concurrently as the current parallel MVP, then later stages can read their declared outputs. Phase prompts may include `{task}`, which is replaced with the original chain task. If omitted, the original task is appended to the phase prompt.
+Every chain phase must declare `model: provider/model`; chain execution does not fall back to agent frontmatter, settings defaults, or the parent model. Stages run sequentially by default. A stage may set `mode: parallel` and contain `phases:`; phases in that stage run concurrently as the current parallel MVP, then later stages can read their declared outputs. Phase prompts may include `{task}`, which is replaced with the original chain task. If omitted, the original task is appended to the phase prompt.
 
 Run or inspect chains with the `chain` tool:
 

@@ -4,6 +4,7 @@ description: Execute a task through context, red, green, refactor, and review ph
 stages:
   - id: context
     agent: context-builder
+    model: openai-codex/gpt-5.5
     output: context.md
     outputMode: file-only
     prompt: |
@@ -24,6 +25,7 @@ stages:
 
   - id: red
     agent: red
+    model: openai-codex/gpt-5.5
     reads:
       - context.md
     output: red.md
@@ -43,6 +45,7 @@ stages:
 
   - id: green
     agent: green
+    model: openai-codex/gpt-5.5
     reads:
       - context.md
       - red.md
@@ -63,6 +66,7 @@ stages:
 
   - id: refactor
     agent: worker
+    model: openai-codex/gpt-5.5
     reads:
       - context.md
       - red.md
@@ -85,6 +89,7 @@ stages:
 
   - id: review
     agent: reviewer
+    model: anthropic/claude-opus-4-8
     reads:
       - context.md
       - red.md
