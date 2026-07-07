@@ -154,6 +154,7 @@ const liveJobs = new Map<string, JobMetadata>();
 const liveChains = new Map<string, ChainRunMetadata>();
 let lastUiContext: ExtensionContext | null = null;
 let widgetRefreshTimer: ReturnType<typeof setInterval> | null = null;
+let chainWidgetExpanded = false;
 
 function emptyUsage(): UsageStats {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
@@ -621,7 +622,7 @@ function currentChainStep(chain: ChainRunMetadata): number {
 	return index >= 0 ? index + 1 : chain.phases.length;
 }
 
-function renderChainWidgetLines(chain: ChainRunMetadata, now = Date.now()): string[] {
+function renderChainWidgetLines(chain: ChainRunMetadata, now = Date.now(), expanded = false): string[] {
 	const progress = chainProgress(chain);
 	const glyph = chain.status === "running" ? runningGlyph(now) : chain.status === "complete" ? "✓" : "✗";
 	const lines = [`  ${glyph} ${chain.chain} · ${chain.status} · step ${currentChainStep(chain)}/${progress.total} · ${formatDuration(Math.max(0, now - Date.parse(chain.startedAt)))}`];
@@ -638,15 +639,16 @@ function renderChainWidgetLines(chain: ChainRunMetadata, now = Date.now()): stri
 			const status: ChainPhaseRunStatus = failed ? "failed" : running ? "running" : done === phases.length ? "complete" : "pending";
 			lines.push(`    ${chainPhaseGlyph(status)} ${stage.id} · parallel · ${done}/${phases.length} done${running ? ` · ${running} running` : ""}`);
 			shownRows++;
-			for (const phase of phases.slice(0, 3)) {
+			const visiblePhases = expanded ? phases : phases.slice(0, 3);
+			for (const phase of visiblePhases) {
 				lines.push(`      ${chainPhaseGlyph(phase.status)} ${phase.phaseId} · ${phase.status} · ${chainPhaseRuntimeDetails(phase, now).join(" · ")}`);
 				shownPhaseIds.add(phase.phaseId);
 			}
-			if (phases.length > 3) lines.push(`      +${phases.length - 3} phases`);
+			if (!expanded && phases.length > 3) lines.push(`      +${phases.length - 3} phases · ctrl+o to expand`);
 			continue;
 		}
 		for (const phase of phases) {
-			if (shownRows >= 5) continue;
+			if (!expanded && shownRows >= 5) continue;
 			const attempt = latestAttempt(phase);
 			const error = phase.status === "failed" && attempt?.errorMessage ? ` · ${attempt.errorMessage.slice(0, 80)}` : "";
 			lines.push(`    ${chainPhaseGlyph(phase.status)} ${phase.phaseId} · ${phase.status} · ${chainPhaseRuntimeDetails(phase, now).join(" · ")}${error}`);
@@ -655,7 +657,8 @@ function renderChainWidgetLines(chain: ChainRunMetadata, now = Date.now()): stri
 		}
 	}
 	const hidden = Math.max(0, chain.phases.length - shownPhaseIds.size);
-	if (hidden > 0) lines.push(`    +${hidden} phases`);
+	if (hidden > 0) lines.push(`    +${hidden} phases · ctrl+o to expand`);
+	else if (expanded && chain.phases.length > 0) lines.push("    ctrl+o to collapse");
 	if (chain.status === "failed") lines.push(`    Resume: chain({ action: "resume", chainId: "${chain.id}" })`);
 	return lines;
 }
@@ -679,7 +682,7 @@ function buildAsyncWidgetSection(jobs: JobMetadata[], chains: ChainRunMetadata[]
 		const status = job.status === "complete" ? "done" : job.status;
 		lines.push(`  ${statusGlyph(job.status)} ${job.agent} · ${status}${stats ? ` · ${stats}` : ""} · ${widgetActivity(job, now)}`);
 	}
-	for (const chain of chains.slice(0, 2)) lines.push(...renderChainWidgetLines(chain, now));
+	for (const chain of chains.slice(0, 2)) lines.push(...renderChainWidgetLines(chain, now, chainWidgetExpanded));
 	const hidden = Math.max(0, jobs.length - 3) + Math.max(0, chains.length - 2);
 	if (hidden > 0) lines.push(`  +${hidden} more`);
 	return { lines, summary, active: Boolean(runningJobs || runningChains || queued) };
@@ -1166,19 +1169,20 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 		description: "Read a declared chain handoff file for the current chain phase. Supports offset/limit like read. Only works inside a chain phase.",
 		parameters: ChainReadParams,
 		async execute(_toolCallId, params) {
+			const details = { filename: params.filename, offset: params.offset, limit: params.limit ?? READ_TRUNCATE_LINES };
 			const contextPath = process.env.CHAIN_PHASE_CONTEXT;
-			if (!contextPath) return { content: [{ type: "text", text: "chain_read is only available inside a chain phase." }], isError: true };
+			if (!contextPath) return { content: [{ type: "text", text: "chain_read is only available inside a chain phase." }], isError: true, details };
 			const phaseContext = readJson<ChainPhaseContext>(contextPath);
-			if (!phaseContext) return { content: [{ type: "text", text: "Invalid chain phase context." }], isError: true };
-			if (!phaseContext.allowedReads.includes(params.filename)) return { content: [{ type: "text", text: `Read not allowed by this phase: ${params.filename}` }], isError: true };
+			if (!phaseContext) return { content: [{ type: "text", text: "Invalid chain phase context." }], isError: true, details };
+			if (!phaseContext.allowedReads.includes(params.filename)) return { content: [{ type: "text", text: `Read not allowed by this phase: ${params.filename}` }], isError: true, details };
 			const outputsDir = chainOutputsDir(phaseContext.chainDir);
 			const filePath = path.join(outputsDir, params.filename);
-			if (!isPathInside(outputsDir, filePath)) return { content: [{ type: "text", text: "Invalid chain read path." }], isError: true };
+			if (!isPathInside(outputsDir, filePath)) return { content: [{ type: "text", text: "Invalid chain read path." }], isError: true, details };
 			let content: string;
-			try { content = fs.readFileSync(filePath, "utf-8"); } catch { return { content: [{ type: "text", text: `Chain input not found: ${params.filename}` }], isError: true }; }
+			try { content = fs.readFileSync(filePath, "utf-8"); } catch { return { content: [{ type: "text", text: `Chain input not found: ${params.filename}` }], isError: true, details }; }
 			const lines = content.split("\n");
 			const start = params.offset ? Math.max(0, params.offset - 1) : 0;
-			const limit = params.limit ?? READ_TRUNCATE_LINES;
+			const limit = details.limit;
 			let selected = lines.slice(start, start + limit).join("\n");
 			let truncated = start + limit < lines.length;
 			if (selected.length > READ_TRUNCATE_BYTES) { selected = selected.slice(0, READ_TRUNCATE_BYTES); truncated = true; }
@@ -1193,14 +1197,16 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 		description: "Persist the official output for the current chain phase. Only works inside a chain phase and validates allowed outputs.",
 		parameters: ChainOutputParams,
 		async execute(_toolCallId, params) {
+			let details = { filename: params.filename ?? "", outputPath: "" };
 			const contextPath = process.env.CHAIN_PHASE_CONTEXT;
-			if (!contextPath) return { content: [{ type: "text", text: "chain_output is only available inside a chain phase." }], isError: true };
+			if (!contextPath) return { content: [{ type: "text", text: "chain_output is only available inside a chain phase." }], isError: true, details };
 			const phaseContext = readJson<ChainPhaseContext>(contextPath);
-			if (!phaseContext) return { content: [{ type: "text", text: "Invalid chain phase context." }], isError: true };
+			if (!phaseContext) return { content: [{ type: "text", text: "Invalid chain phase context." }], isError: true, details };
 			const filename = params.filename ?? phaseContext.defaultOutput;
-			if (!filename) return { content: [{ type: "text", text: "filename is required for this phase." }], isError: true };
-			if (!phaseContext.allowedOutputs.includes(filename)) return { content: [{ type: "text", text: `Output not allowed by this phase: ${filename}` }], isError: true };
+			if (!filename) return { content: [{ type: "text", text: "filename is required for this phase." }], isError: true, details };
+			if (!phaseContext.allowedOutputs.includes(filename)) return { content: [{ type: "text", text: `Output not allowed by this phase: ${filename}` }], isError: true, details };
 			const outputPath = chainAttemptOutputPath(phaseContext.attemptDir, filename);
+			details = { filename, outputPath };
 			await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
 			await fs.promises.writeFile(outputPath, params.content, "utf-8");
 			return { content: [{ type: "text", text: `chain output saved: ${filename}` }], details: { filename, outputPath } };
@@ -1211,6 +1217,16 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 		lastUiContext = ctx;
 		try { ctx.ui.setWidget(LEGACY_WIDGET_KEY, undefined); } catch { /* ignore stale legacy widget */ }
 		renderAsyncWidget(ctx);
+	});
+
+	pi.registerShortcut("ctrl+o", {
+		description: "Toggle full chain details in the async agents widget",
+		handler: async (ctx) => {
+			chainWidgetExpanded = !chainWidgetExpanded;
+			lastUiContext = ctx;
+			renderAsyncWidget(ctx);
+			ctx.ui.notify(`Chain details ${chainWidgetExpanded ? "expanded" : "collapsed"}.`, "info");
+		},
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
@@ -1259,7 +1275,7 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 				}
 				const discovery = discoverChains(chainRun.cwd, chainScope);
 				const chain = discovery.chains.find((c) => c.name === chainRun.chain);
-				if (!chain) return { content: [{ type: "text", text: `Chain definition not found for resume: ${chainRun.chain}` }], isError: true };
+				if (!chain) return { content: [{ type: "text", text: `Chain definition not found for resume: ${chainRun.chain}` }], isError: true, details: { sessionId, baseDir } };
 				chainRun.status = "running";
 				chainRun.errorMessage = undefined;
 				liveChains.set(chainRun.id, chainRun);
