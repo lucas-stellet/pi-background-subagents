@@ -34,6 +34,7 @@ const LEGACY_WIDGET_KEY = "subagent-async";
 const CHAIN_JOBS_ROOT_NAME = "pi-chains";
 const READ_TRUNCATE_LINES = 2000;
 const READ_TRUNCATE_BYTES = 50_000;
+const CTRL_O = "\x0f";
 
 type JobStatus = "queued" | "running" | "complete" | "failed" | "paused" | "cancelled";
 
@@ -702,6 +703,12 @@ function renderAsyncWidget(ctx: ExtensionContext | null = lastUiContext): void {
 	void publishWidgetStackSection(ctx, section.lines, section.summary, section.active).catch(() => undefined);
 }
 
+function toggleChainWidgetExpanded(ctx: ExtensionContext): void {
+	chainWidgetExpanded = !chainWidgetExpanded;
+	lastUiContext = ctx;
+	renderAsyncWidget(ctx);
+}
+
 interface StartJobOptions {
 	cwd?: string;
 	tools?: string[];
@@ -1216,17 +1223,14 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 	pi.on("session_start", (_event, ctx) => {
 		lastUiContext = ctx;
 		try { ctx.ui.setWidget(LEGACY_WIDGET_KEY, undefined); } catch { /* ignore stale legacy widget */ }
+		if (ctx.mode === "tui") {
+			ctx.ui.onTerminalInput((data) => {
+				if (data !== CTRL_O || activeWidgetChains().length === 0) return undefined;
+				toggleChainWidgetExpanded(ctx);
+				return { consume: true };
+			});
+		}
 		renderAsyncWidget(ctx);
-	});
-
-	pi.registerShortcut("ctrl+o", {
-		description: "Toggle full chain details in the async agents widget",
-		handler: async (ctx) => {
-			chainWidgetExpanded = !chainWidgetExpanded;
-			lastUiContext = ctx;
-			renderAsyncWidget(ctx);
-			ctx.ui.notify(`Chain details ${chainWidgetExpanded ? "expanded" : "collapsed"}.`, "info");
-		},
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
