@@ -149,6 +149,19 @@ interface ChainPhaseContext {
 	defaultOutput?: string;
 }
 
+interface ChainProcessSnapshot {
+	stageId: string;
+	phaseId: string;
+	attempt: number;
+	jobId?: string;
+	jobDir?: string;
+	jobStatus?: JobStatus;
+	pid?: number;
+	processRunning: boolean;
+	trackedByRuntime: boolean;
+	command?: string;
+}
+
 const runningJobs = new Map<string, ChildProcessWithoutNullStreams>();
 const cancelledJobs = new Set<string>();
 const liveJobs = new Map<string, JobMetadata>();
@@ -226,6 +239,26 @@ function readJson<T>(filePath: string): T | null {
 		return JSON.parse(fs.readFileSync(filePath, "utf-8")) as T;
 	} catch {
 		return null;
+	}
+}
+
+function isProcessRunning(pid: number | undefined): boolean {
+	if (!pid || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error: any) {
+		return error?.code === "EPERM";
+	}
+}
+
+function readProcessCommand(pid: number | undefined): string | undefined {
+	if (!pid || process.platform !== "linux") return undefined;
+	try {
+		const command = fs.readFileSync(`/proc/${pid}/cmdline`, "utf-8").split("\0").filter(Boolean).join(" ");
+		return command ? command.slice(0, 240) : undefined;
+	} catch {
+		return undefined;
 	}
 }
 
@@ -608,6 +641,68 @@ function chainPhaseRuntimeDetails(phase: ChainPhaseRunMetadata, now = Date.now()
 	return details;
 }
 
+function isActiveJobStatus(status: JobStatus | undefined): boolean {
+	return status === "queued" || status === "running" || status === "paused";
+}
+
+function chainProcessSnapshots(chain: ChainRunMetadata): ChainProcessSnapshot[] {
+	const snapshots: ChainProcessSnapshot[] = [];
+	for (const phase of chain.phases) {
+		const attempt = latestAttempt(phase);
+		const job = attempt?.jobDir ? readJson<JobMetadata>(statusPath(attempt.jobDir)) : null;
+		if (phase.status !== "running" && attempt?.status !== "running" && !isActiveJobStatus(job?.status)) continue;
+		const trackedByRuntime = job?.id ? runningJobs.has(job.id) : false;
+		const processRunning = trackedByRuntime || isProcessRunning(job?.pid);
+		snapshots.push({
+			stageId: phase.stageId,
+			phaseId: phase.phaseId,
+			attempt: attempt?.attempt ?? phase.attempts.length,
+			jobId: job?.id ?? attempt?.jobId,
+			jobDir: job?.jobDir ?? attempt?.jobDir,
+			jobStatus: job?.status,
+			pid: job?.pid,
+			processRunning,
+			trackedByRuntime,
+			command: processRunning ? readProcessCommand(job?.pid) : undefined,
+		});
+	}
+	return snapshots;
+}
+
+function formatChainProcessSection(chain: ChainRunMetadata, snapshots = chainProcessSnapshots(chain)): string[] {
+	const controllerTracked = liveChains.has(chain.id);
+	const lines = [
+		"Process check (current runtime):",
+		`- Chain controller: ${controllerTracked ? "active in this Pi runtime" : "not registered in this Pi runtime"}`,
+	];
+	if (snapshots.length === 0) {
+		if (chain.status === "running") {
+			lines.push(
+				"- Phase process: not found for any phase marked active in status.json.",
+				"  Result: this chain is not executing now; the status.json section below is only the last persisted state.",
+			);
+		} else {
+			lines.push(`- Phase process: none expected for status.json state '${chain.status}'.`);
+		}
+		return lines;
+	}
+	for (const snapshot of snapshots) {
+		const pid = snapshot.pid ? `pid=${snapshot.pid}` : "pid not recorded";
+		const job = snapshot.jobId ? `job=${snapshot.jobId}` : "job not recorded";
+		const status = snapshot.jobStatus ? `job status.json=${snapshot.jobStatus}` : "job status.json missing";
+		const origin = snapshot.trackedByRuntime ? "tracked by this runtime" : "found via OS pid check only";
+		if (snapshot.processRunning) lines.push(`- ${snapshot.stageId}/${snapshot.phaseId} attempt ${snapshot.attempt}: process found (${pid}, ${job}, ${status}, ${origin}).`);
+		else lines.push(`- ${snapshot.stageId}/${snapshot.phaseId} attempt ${snapshot.attempt}: process not found (${pid}, ${job}, ${status}).`);
+		if (snapshot.command) lines.push(`  Command: ${snapshot.command}`);
+	}
+	if (chain.status === "running" && snapshots.every((snapshot) => !snapshot.processRunning)) {
+		lines.push("  Result: this chain is not executing now; the status.json section below is only the last persisted state.");
+	} else if (chain.status === "running" && !controllerTracked) {
+		lines.push("  Note: a phase process exists, but the chain controller is not registered in this Pi runtime; the persisted status may be stale after a restart.");
+	}
+	return lines;
+}
+
 function chainProgress(chain: ChainRunMetadata): { complete: number; running: number; pending: number; failed: number; total: number } {
 	return {
 		complete: chain.phases.filter((phase) => phase.status === "complete").length,
@@ -956,11 +1051,17 @@ function formatChainList(chains: ChainConfig[]): string {
 	return [`Available chains: ${chains.length}`, "", ...chains.map((chain) => `- ${chain.name} · ${chain.source}\n  ${chain.description || "(no description)"}\n  File: ${chain.filePath}`)].join("\n");
 }
 
-function formatChainRunStatus(chain: ChainRunMetadata, verbose = false): string {
-	const lines = [`${chain.chain} · ${chain.status}`, `Chain: ${chain.id}`, `Started: ${chain.startedAt}`];
+function formatChainRunStatus(chain: ChainRunMetadata, verbose = false, processSnapshots = chainProcessSnapshots(chain)): string {
+	const lines = [
+		...formatChainProcessSection(chain, processSnapshots),
+		"",
+		`status.json (last persisted state): ${chain.chain} · ${chain.status}`,
+		`Chain: ${chain.id}`,
+		`Started: ${chain.startedAt}`,
+	];
 	if (chain.finishedAt) lines.push(`Finished: ${chain.finishedAt}`);
 	if (chain.errorMessage) lines.push(`Error: ${chain.errorMessage}`);
-	lines.push("", "Phases:");
+	lines.push("", "Phases from status.json:");
 	for (const phase of chain.phases) {
 		lines.push(`- ${phase.stageId}/${phase.phaseId} · ${phase.status} · ${chainPhaseRuntimeDetails(phase).join(" · ")} · attempts ${phase.attempts.length}${phase.outputs.length ? ` · outputs ${phase.outputs.join(", ")}` : ""}`);
 		if (verbose) for (const attempt of phase.attempts) lines.push(`  - attempt ${attempt.attempt}: ${attempt.status}${attempt.jobId ? ` job=${attempt.jobId}` : ""}${attempt.errorMessage ? ` error=${attempt.errorMessage}` : ""}`);
@@ -1248,6 +1349,7 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 			"After chain start, tell the user it is running and wait for follow-up notifications instead of repeatedly calling chain status.",
 			"Do not poll chain status just to see whether the next phase has started; phase transitions are reported by concise follow-up messages.",
 			"Use chain status only when the user asks for progress or when there is a concrete reason to suspect a blocker.",
+			"When chain status reports no current process but status.json says running, explain that the chain is not executing now and status.json is only the last persisted state.",
 			"Use chain result after the completion notification to inspect outputs and summarize the outcome.",
 		],
 		parameters: ChainParams,
@@ -1268,7 +1370,10 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 				const chainDir = path.join(baseDir, safeName(params.chainId));
 				const chainRun = readJson<ChainRunMetadata>(chainStatusPath(chainDir));
 				if (!chainRun) return { content: [{ type: "text", text: `Chain not found in this session: ${params.chainId}` }], isError: true, details: { sessionId, baseDir } };
-				if (action === "status") return { content: [{ type: "text", text: formatChainRunStatus(chainRun, params.verbose ?? false) }], details: { sessionId, baseDir, chain: chainRun } };
+				if (action === "status") {
+					const processSnapshots = chainProcessSnapshots(chainRun);
+					return { content: [{ type: "text", text: formatChainRunStatus(chainRun, params.verbose ?? false, processSnapshots) }], details: { sessionId, baseDir, chain: chainRun, process: processSnapshots } };
+				}
 				if (action === "result") {
 					const outputs: Record<string, string> = {};
 					for (const phase of chainRun.phases) for (const output of phase.outputs) {
