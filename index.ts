@@ -352,6 +352,24 @@ export function formatElapsedMinutes(ms: number): string {
 	return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
 
+export function formatAgentDuration(ms: number): string {
+	const elapsed = Math.max(0, ms);
+	if (elapsed < 30_000) return "<30s";
+	if (elapsed < 60_000) return "30s";
+	return formatElapsedMinutes(elapsed);
+}
+
+function elapsedMs(startedAt: string, finishedAt: string | undefined, now: number): number {
+	const start = Date.parse(startedAt);
+	const end = finishedAt ? Date.parse(finishedAt) : now;
+	if (!Number.isFinite(start) || !Number.isFinite(end)) return 0;
+	return Math.max(0, end - start);
+}
+
+function jobElapsedMs(job: Pick<JobMetadata, "startedAt" | "finishedAt">, now: number): number {
+	return elapsedMs(job.startedAt, job.finishedAt, now);
+}
+
 function formatTokens(count: number): string {
 	if (count < 1000) return String(count);
 	if (count < 10_000) return `${(count / 1000).toFixed(1)}k`;
@@ -443,7 +461,7 @@ function promptModeDetail(job: Partial<Pick<JobMetadata, "systemPromptMode" | "i
 }
 
 function compactJobLine(job: JobMetadata, now = Date.now()): string {
-	const parts = [job.agent, job.status, modelLabel(job), formatDuration(Math.max(0, now - Date.parse(job.startedAt)))];
+	const parts = [job.agent, job.status, modelLabel(job), formatAgentDuration(jobElapsedMs(job, now))];
 	const tokens = job.usage.input + job.usage.output;
 	if (tokens > 0) parts.push(`${formatTokens(tokens)} tok`);
 	if (job.turnCount !== undefined) parts.push(`${job.turnCount} turns`);
@@ -454,8 +472,8 @@ function compactJobLine(job: JobMetadata, now = Date.now()): string {
 function formatActivityLabel(lastActivityAt: number | undefined, now = Date.now()): string | undefined {
 	if (lastActivityAt === undefined) return undefined;
 	const age = Math.max(0, now - lastActivityAt);
-	if (age < 1000) return "active now";
-	if (age < 60_000) return `active ${Math.floor(age / 1000)}s ago`;
+	if (age < 30_000) return "active now";
+	if (age < 60_000) return "active 30s ago";
 	return `active ${Math.floor(age / 60_000)}m ago`;
 }
 
@@ -475,7 +493,7 @@ function statusGlyph(status: JobStatus): string {
 
 function widgetActivity(job: JobMetadata, now = Date.now()): string {
 	const facts: string[] = [];
-	if (job.currentTool && job.currentToolStartedAt !== undefined) facts.push(`${job.currentTool} ${formatDuration(Math.max(0, now - job.currentToolStartedAt))}`);
+	if (job.currentTool && job.currentToolStartedAt !== undefined) facts.push(`${job.currentTool} ${formatAgentDuration(now - job.currentToolStartedAt)}`);
 	else if (job.currentTool) facts.push(job.currentTool);
 	const activity = formatActivityLabel(job.lastActivityAt, now);
 	if (activity && facts.length) return `${activity} · ${facts.join(" · ")}`;
@@ -490,7 +508,7 @@ function widgetActivity(job: JobMetadata, now = Date.now()): string {
 }
 
 function widgetStats(job: JobMetadata, now = Date.now()): string {
-	const parts: string[] = [modelLabel(job), formatDuration(Math.max(0, now - Date.parse(job.startedAt)))];
+	const parts: string[] = [modelLabel(job), formatAgentDuration(jobElapsedMs(job, now))];
 	const totalTokens = job.usage.input + job.usage.output;
 	if (totalTokens > 0) parts.push(`${formatTokens(totalTokens)} tok`);
 	if (job.turnCount !== undefined) parts.push(`${job.turnCount} turns`);
@@ -645,7 +663,8 @@ function chainPhaseRuntimeDetails(phase: ChainPhaseRunMetadata, now = Date.now()
 	const attempt = latestAttempt(phase);
 	const details = [chainPhaseModelLabel(phase, job)];
 	const startedAt = job?.startedAt ?? attempt?.startedAt;
-	if (startedAt) details.push(`${phase.status === "running" ? "active" : "ran"} ${formatDuration(Math.max(0, now - Date.parse(startedAt)))}`);
+	const finishedAt = job?.finishedAt ?? attempt?.finishedAt;
+	if (startedAt) details.push(`${phase.status === "running" ? "active" : "ran"} ${formatAgentDuration(elapsedMs(startedAt, finishedAt, now))}`);
 	if (job?.currentTool) details.push(`tool ${job.currentTool}`);
 	else if (job?.lastActivityAt) details.push(`last ${formatActivityLabel(job.lastActivityAt, now)}`);
 	if (job?.toolCount !== undefined) details.push(`${job.toolCount} tools`);
