@@ -4,10 +4,15 @@
   "description": "A Pi extension that runs subagents in the background and notifies the parent agent when results are ready.",
   "type": "module",
   "main": "index.ts",
+  "scripts": {
+    "test": "node --test tests/*.test.ts",
+    "check": "tsc --noEmit --allowImportingTsExtensions --skipLibCheck --module nodenext --moduleResolution nodenext --target es2022 --types node index.ts agents.ts chains.ts intercom.ts tests/*.test.ts"
+  },
   "files": [
     "index.ts",
     "agents.ts",
     "chains.ts",
+    "intercom.ts",
     "examples",
     "README.md",
     "LICENSE"
@@ -24,10 +29,14 @@
     ]
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*",
     "typebox": "*"
   },
-  "license": "MIT"
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^26.1.1",
+    "typescript": "^7.0.2"
+  }
 }

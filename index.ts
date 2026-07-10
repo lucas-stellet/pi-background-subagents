@@ -8,7 +8,7 @@
  *   so it can inspect and validate the result.
  */
 
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -25,6 +25,7 @@ import {
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import { type ChainConfig, type ChainMode, type ChainPhase, type ChainScope, discoverChains } from "./chains.ts";
+import { prepareSubagentIntercom } from "./intercom.ts";
 
 const CUSTOM_TYPE = "background-subagents";
 const JOBS_ROOT_NAME = "pi-subagents";
@@ -162,7 +163,7 @@ interface ChainProcessSnapshot {
 	command?: string;
 }
 
-const runningJobs = new Map<string, ChildProcessWithoutNullStreams>();
+const runningJobs = new Map<string, ChildProcess>();
 const cancelledJobs = new Set<string>();
 const liveJobs = new Map<string, JobMetadata>();
 const liveChains = new Map<string, ChainRunMetadata>();
@@ -184,6 +185,10 @@ function getSessionId(ctx: ExtensionContext): string {
 
 	const sessionFile = ctx.sessionManager.getSessionFile() ?? `ephemeral:${ctx.cwd}`;
 	return createHash("sha256").update(sessionFile).digest("hex").slice(0, 16);
+}
+
+function getSupervisorTarget(ctx: ExtensionContext): string | undefined {
+	return ctx.sessionManager.getSessionId?.()?.trim() || undefined;
 }
 
 function getBaseDir(sessionId: string): string {
@@ -813,6 +818,8 @@ interface StartJobOptions {
 	notifyOnFinish?: boolean;
 	sessionId?: string;
 	skipWidget?: boolean;
+	intercomRunId?: string;
+	intercomChildIndex?: number;
 }
 
 async function startJob(
@@ -858,17 +865,32 @@ async function startJob(
 		turnCount: 0,
 	};
 
-	await writeJson(path.join(jobDir, "task.json"), { agent, task, cwd: job.cwd });
+	const supervisorTarget = getSupervisorTarget(ctx);
+	const intercom = prepareSubagentIntercom(
+		supervisorTarget
+			? {
+				orchestratorTarget: supervisorTarget,
+				runId: options.intercomRunId ?? jobId,
+				agent: agent.name,
+				childIndex: options.intercomChildIndex ?? 0,
+			}
+			: undefined,
+		options.tools ?? agent.tools,
+	);
+	const intercomBridge = intercom.bridge;
+
+	await writeJson(path.join(jobDir, "task.json"), { agent, task, cwd: job.cwd, intercom: intercomBridge?.env });
 	await writeJson(statusPath(jobDir), job);
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
 	if (initialModel.model) args.push("--model", initialModel.model);
 	if (!agent.inheritProjectContext) args.push("--no-context-files");
 	if (!agent.inheritSkills) args.push("--no-skills");
-	const tools = options.tools ?? agent.tools;
+	const tools = intercom.tools;
 	if (tools && tools.length > 0) args.push("--tools", tools.join(","));
 
-	const systemPrompt = options.promptPrefix ? `${options.promptPrefix}\n\n${agent.systemPrompt}` : agent.systemPrompt;
+	const promptParts = [intercomBridge?.instruction, options.promptPrefix, agent.systemPrompt].filter((part): part is string => Boolean(part));
+	const systemPrompt = promptParts.join("\n\n");
 	const promptPath = await writePromptToTempFile(jobDir, agent.name, systemPrompt);
 	if (promptPath) args.push(agent.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt", promptPath);
 	args.push(`Task: ${task}`);
@@ -878,7 +900,7 @@ async function startJob(
 		cwd: job.cwd,
 		shell: false,
 		stdio: ["ignore", "pipe", "pipe"],
-		env: { ...process.env, ...(options.env ?? {}) },
+		env: { ...process.env, ...(options.env ?? {}), ...(intercomBridge?.env ?? {}) },
 	});
 	job.pid = proc.pid;
 	await writeJson(statusPath(jobDir), job);
@@ -1132,6 +1154,8 @@ async function runChainPhase(pi: ExtensionAPI, ctx: ExtensionContext, chainRun: 
 		notifyOnFinish: false,
 		sessionId: chainRun.sessionId,
 		skipWidget: true,
+		intercomRunId: chainRun.id,
+		intercomChildIndex: chainRun.phases.indexOf(phaseRun),
 	});
 	attempt.jobId = job.id;
 	attempt.jobDir = job.jobDir;

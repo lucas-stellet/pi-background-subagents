@@ -32,6 +32,7 @@ Implemented:
   ```
 
 - Sends a follow-up user message to the parent agent when a job finishes.
+- Integrates with `pi-intercom`: child jobs receive a safe supervisor target and can use `contact_supervisor` for blocking decisions or meaningful progress updates.
 - Supports management actions:
   - `start`
   - `status`
@@ -276,6 +277,22 @@ Project-local agents run without an interactive confirmation by default. To opt 
   "confirmProjectAgents": true
 }
 ```
+
+## Supervisor coordination
+
+Install `pi-intercom` globally and reload Pi:
+
+```bash
+pi install npm:pi-intercom
+```
+
+When the parent session has a persisted session ID, each child receives the `PI_SUBAGENT_*` bridge metadata expected by `pi-intercom`. `contact_supervisor` is added to explicit child tool allowlists, and the child prompt explains the coordination contract:
+
+- `need_decision` blocks until the parent replies;
+- `progress_update` sends a non-blocking, plan-changing update;
+- routine completion still returns through the normal subagent/chain result.
+
+The bridge fails closed when the parent has no targetable session ID: no supervisor metadata or tool elevation is added.
 
 ## Runtime behavior
 
