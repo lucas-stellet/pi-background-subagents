@@ -20,8 +20,8 @@ function runningChain(startedAt: string, id = "chain-1") {
 }
 
 test("formats elapsed chain time at minute granularity", () => {
-	assert.equal(formatElapsedMinutes(0), "0m");
-	assert.equal(formatElapsedMinutes(59_999), "0m");
+	assert.equal(formatElapsedMinutes(0), "<1m");
+	assert.equal(formatElapsedMinutes(59_999), "<1m");
 	assert.equal(formatElapsedMinutes(60_000), "1m");
 	assert.equal(formatElapsedMinutes(3_780_000), "1h 3m");
 });

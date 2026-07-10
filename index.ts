@@ -347,6 +347,7 @@ function formatDuration(ms: number): string {
 
 export function formatElapsedMinutes(ms: number): string {
 	const minutes = Math.floor(Math.max(0, ms) / 60_000);
+	if (minutes === 0) return "<1m";
 	if (minutes < 60) return `${minutes}m`;
 	return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
