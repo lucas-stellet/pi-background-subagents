@@ -24,6 +24,15 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import { releaseChainControllerLock, tryAcquireChainControllerLock } from "./chain-lock.ts";
+import {
+	checkChainDefinitionCompatibility,
+	checkChainResumeEligibility,
+	computeChainDefinitionFingerprint,
+	prepareChainRunForResume,
+	repairInterruptedChainForResume,
+	resolveChainScopeForResume,
+} from "./chain-resume.ts";
 import { type ChainConfig, type ChainMode, type ChainPhase, type ChainScope, discoverChains } from "./chains.ts";
 import { prepareSubagentIntercom } from "./intercom.ts";
 
@@ -126,6 +135,8 @@ interface ChainRunMetadata {
 	sessionId: string;
 	chain: string;
 	chainSource: "user" | "project";
+	chainScope?: ChainScope;
+	chainDefinitionFingerprint?: string;
 	task: string;
 	cwd: string;
 	chainDir: string;
@@ -167,6 +178,8 @@ const runningJobs = new Map<string, ChildProcess>();
 const cancelledJobs = new Set<string>();
 const liveJobs = new Map<string, JobMetadata>();
 const liveChains = new Map<string, ChainRunMetadata>();
+const chainControllers = new Set<string>();
+const chainControllerOwner = { runtimeId: randomUUID(), pid: process.pid };
 let lastUiContext: ExtensionContext | null = null;
 let widgetRefreshTimer: ReturnType<typeof setInterval> | null = null;
 let chainWidgetExpanded = false;
@@ -701,7 +714,7 @@ function chainProcessSnapshots(chain: ChainRunMetadata): ChainProcessSnapshot[] 
 }
 
 function formatChainProcessSection(chain: ChainRunMetadata, snapshots = chainProcessSnapshots(chain)): string[] {
-	const controllerTracked = liveChains.has(chain.id);
+	const controllerTracked = chainControllers.has(chain.id);
 	const lines = [
 		"Process check (current runtime):",
 		`- Chain controller: ${controllerTracked ? "active in this Pi runtime" : "not registered in this Pi runtime"}`,
@@ -1438,15 +1451,106 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 					const text = Object.entries(outputs).map(([file, content]) => `# ${file}\n\n${content}`).join("\n\n---\n\n") || "(no chain outputs found)";
 					return { content: [{ type: "text", text }], details: { sessionId, baseDir, chain: chainRun, outputs } };
 				}
-				const discovery = discoverChains(chainRun.cwd, chainScope);
+				const processSnapshots = chainProcessSnapshots(chainRun);
+				const runtime = {
+					controllerAlive: chainControllers.has(chainRun.id),
+					phaseProcessAlive: processSnapshots.some((snapshot) => snapshot.processRunning),
+				};
+				const eligibility = checkChainResumeEligibility(chainRun, runtime);
+				if (!eligibility.eligible) {
+					return { content: [{ type: "text", text: eligibility.message }], isError: true, details: { sessionId, baseDir, chain: chainRun, code: eligibility.code, process: processSnapshots } };
+				}
+				const resumeScope = resolveChainScopeForResume(chainRun, params.chainScope);
+				const discovery = discoverChains(chainRun.cwd, resumeScope);
 				const chain = discovery.chains.find((c) => c.name === chainRun.chain);
 				if (!chain) return { content: [{ type: "text", text: `Chain definition not found for resume: ${chainRun.chain}` }], isError: true, details: { sessionId, baseDir } };
-				chainRun.status = "running";
-				chainRun.errorMessage = undefined;
+				const compatibility = checkChainDefinitionCompatibility(chainRun.chainDefinitionFingerprint, chain);
+				if (!compatibility.compatible) {
+					return { content: [{ type: "text", text: `Chain definition changed since ${chainRun.id} started and cannot be resumed.` }], isError: true, details: { sessionId, baseDir, chain: chainRun, code: compatibility.code } };
+				}
+				if (!tryAcquireChainControllerLock(chainDir, chainControllerOwner)) {
+					return { content: [{ type: "text", text: `Controller lock is held for chain ${chainRun.id}; it cannot be resumed.` }], isError: true, details: { sessionId, baseDir, chain: chainRun, code: "controller_lock_held" } };
+				}
+				chainControllers.add(chainRun.id);
+				try {
+					repairInterruptedChainForResume(chainRun, { ...runtime, interruptedAt: new Date().toISOString() });
+					prepareChainRunForResume(chainRun);
+					liveChains.set(chainRun.id, chainRun);
+					await writeJson(chainStatusPath(chainDir), chainRun);
+					renderAsyncWidget(ctx);
+					const controller = continueChain(pi, ctx, chainRun, chain, resumeScope).then(async () => {
+						const latest = readJson<ChainRunMetadata>(chainStatusPath(chainDir)) ?? chainRun;
+						if (latest.status === "failed") {
+							const failedPhase = latest.phases.find((phase) => phase.stageId === latest.failedStageId && phase.phaseId === latest.failedPhaseId);
+							const attempt = failedPhase?.attempts.at(-1);
+							await pi.sendUserMessage([
+								`Chain failed at phase ${latest.failedStageId}/${latest.failedPhaseId}`,
+								`Chain: ${latest.chain}`,
+								`Chain ID: ${latest.id}`,
+								`Outputs: ${chainOutputsDir(latest.chainDir)}`,
+								failedPhase ? `Agent: ${failedPhase.agent}` : undefined,
+								attempt ? `Attempt: ${attempt.attempt}` : undefined,
+								`Error: ${latest.errorMessage ?? "unknown"}`,
+								`Resume with: chain({ action: "resume", chainId: "${latest.id}" })`,
+							].filter((line): line is string => Boolean(line)).join("\n"), { deliverAs: "followUp" });
+						}
+					}).catch(async (error) => {
+						chainRun.status = "failed";
+						chainRun.errorMessage = error instanceof Error ? error.message : String(error);
+						liveChains.set(chainRun.id, chainRun);
+						await writeJson(chainStatusPath(chainDir), chainRun);
+						renderAsyncWidget(ctx);
+					}).finally(() => {
+						try {
+							releaseChainControllerLock(chainDir, chainControllerOwner);
+						} finally {
+							chainControllers.delete(chainRun.id);
+						}
+					});
+					void controller.catch(() => undefined);
+				} catch (error) {
+					chainControllers.delete(chainRun.id);
+					releaseChainControllerLock(chainDir, chainControllerOwner);
+					throw error;
+				}
+				return { content: [{ type: "text", text: `Resumed chain ${chainRun.id} from failed phase.` }], details: { sessionId, baseDir, chain: chainRun } };
+			}
+
+			if (!params.chain || !params.task) return { content: [{ type: "text", text: "chain and task are required for action \"start\"." }], isError: true, details: { sessionId, baseDir } };
+			const chainCwd = params.cwd ?? ctx.cwd;
+			const discovery = discoverChains(chainCwd, chainScope);
+			const chain = discovery.chains.find((c) => c.name === params.chain);
+			if (!chain) return { content: [{ type: "text", text: `Unknown chain: ${params.chain}` }], isError: true, details: { sessionId, baseDir, chains: discovery.chains } };
+			const chainId = `chain-${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}-${randomUUID().slice(0, 8)}`;
+			const chainDir = path.join(baseDir, chainId);
+			await fs.promises.mkdir(chainDir, { recursive: true });
+			if (!tryAcquireChainControllerLock(chainDir, chainControllerOwner)) {
+				return { content: [{ type: "text", text: `Controller lock is held for chain ${chainId}; it cannot be started.` }], isError: true, details: { sessionId, baseDir, code: "controller_lock_held" } };
+			}
+			let chainRun: ChainRunMetadata;
+			try {
+				await fs.promises.mkdir(chainOutputsDir(chainDir), { recursive: true });
+				chainRun = {
+					id: chainId,
+					sessionId,
+					chain: chain.name,
+					chainSource: chain.source,
+					chainScope,
+					chainDefinitionFingerprint: computeChainDefinitionFingerprint(chain),
+					task: params.task,
+					cwd: chainCwd,
+					chainDir,
+					status: "running",
+					startedAt: new Date().toISOString(),
+					chainFilePath: chain.filePath,
+					stages: chain.stages.map((stage) => ({ id: stage.id, mode: stage.mode, phaseIds: stage.phases.map((phase) => phase.id) })),
+					phases: chain.stages.flatMap((stage) => stage.phases.map((phase) => ({ stageId: stage.id, phaseId: phase.id, agent: phase.agent, model: phase.model, status: "pending" as ChainPhaseRunStatus, attempts: [], outputs: [] }))),
+				};
 				liveChains.set(chainRun.id, chainRun);
 				await writeJson(chainStatusPath(chainDir), chainRun);
 				renderAsyncWidget(ctx);
-				continueChain(pi, ctx, chainRun, chain, chainScope).then(async () => {
+				chainControllers.add(chainRun.id);
+				const controller = continueChain(pi, ctx, chainRun, chain, chainScope).then(async () => {
 					const latest = readJson<ChainRunMetadata>(chainStatusPath(chainDir)) ?? chainRun;
 					if (latest.status === "failed") {
 						const failedPhase = latest.phases.find((phase) => phase.stageId === latest.failedStageId && phase.phaseId === latest.failedPhaseId);
@@ -1468,58 +1572,19 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 					liveChains.set(chainRun.id, chainRun);
 					await writeJson(chainStatusPath(chainDir), chainRun);
 					renderAsyncWidget(ctx);
+				}).finally(() => {
+					try {
+						releaseChainControllerLock(chainDir, chainControllerOwner);
+					} finally {
+						chainControllers.delete(chainRun.id);
+					}
 				});
-				return { content: [{ type: "text", text: `Resumed chain ${chainRun.id} from failed phase.` }], details: { sessionId, baseDir, chain: chainRun } };
+				void controller.catch(() => undefined);
+			} catch (error) {
+				chainControllers.delete(chainId);
+				releaseChainControllerLock(chainDir, chainControllerOwner);
+				throw error;
 			}
-
-			if (!params.chain || !params.task) return { content: [{ type: "text", text: "chain and task are required for action \"start\"." }], isError: true, details: { sessionId, baseDir } };
-			const chainCwd = params.cwd ?? ctx.cwd;
-			const discovery = discoverChains(chainCwd, chainScope);
-			const chain = discovery.chains.find((c) => c.name === params.chain);
-			if (!chain) return { content: [{ type: "text", text: `Unknown chain: ${params.chain}` }], isError: true, details: { sessionId, baseDir, chains: discovery.chains } };
-			const chainId = `chain-${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}-${randomUUID().slice(0, 8)}`;
-			const chainDir = path.join(baseDir, chainId);
-			await fs.promises.mkdir(chainOutputsDir(chainDir), { recursive: true });
-			const chainRun: ChainRunMetadata = {
-				id: chainId,
-				sessionId,
-				chain: chain.name,
-				chainSource: chain.source,
-				task: params.task,
-				cwd: chainCwd,
-				chainDir,
-				status: "running",
-				startedAt: new Date().toISOString(),
-				chainFilePath: chain.filePath,
-				stages: chain.stages.map((stage) => ({ id: stage.id, mode: stage.mode, phaseIds: stage.phases.map((phase) => phase.id) })),
-				phases: chain.stages.flatMap((stage) => stage.phases.map((phase) => ({ stageId: stage.id, phaseId: phase.id, agent: phase.agent, model: phase.model, status: "pending" as ChainPhaseRunStatus, attempts: [], outputs: [] }))),
-			};
-			liveChains.set(chainRun.id, chainRun);
-			await writeJson(chainStatusPath(chainDir), chainRun);
-			renderAsyncWidget(ctx);
-			continueChain(pi, ctx, chainRun, chain, chainScope).then(async () => {
-				const latest = readJson<ChainRunMetadata>(chainStatusPath(chainDir)) ?? chainRun;
-				if (latest.status === "failed") {
-					const failedPhase = latest.phases.find((phase) => phase.stageId === latest.failedStageId && phase.phaseId === latest.failedPhaseId);
-					const attempt = failedPhase?.attempts.at(-1);
-					await pi.sendUserMessage([
-						`Chain failed at phase ${latest.failedStageId}/${latest.failedPhaseId}`,
-						`Chain: ${latest.chain}`,
-						`Chain ID: ${latest.id}`,
-						`Outputs: ${chainOutputsDir(latest.chainDir)}`,
-						failedPhase ? `Agent: ${failedPhase.agent}` : undefined,
-						attempt ? `Attempt: ${attempt.attempt}` : undefined,
-						`Error: ${latest.errorMessage ?? "unknown"}`,
-						`Resume with: chain({ action: "resume", chainId: "${latest.id}" })`,
-					].filter((line): line is string => Boolean(line)).join("\n"), { deliverAs: "followUp" });
-				}
-			}).catch(async (error) => {
-				chainRun.status = "failed";
-				chainRun.errorMessage = error instanceof Error ? error.message : String(error);
-				liveChains.set(chainRun.id, chainRun);
-				await writeJson(chainStatusPath(chainDir), chainRun);
-				renderAsyncWidget(ctx);
-			});
 			return { content: [{ type: "text", text: [`Started chain ${chain.name} · running`, `Chain: ${chainId}`, `Dir: ${chainDir}`, `Outputs: ${chainOutputsDir(chainDir)}`, "", "No polling needed: the chain will send concise follow-up messages for phase transitions, failure, and completion."].join("\n") }], details: { sessionId, baseDir, chain: chainRun } };
 		},
 	});
