@@ -590,6 +590,25 @@ function activeWidgetChains(): ChainRunMetadata[] {
 	return Array.from(liveChains.values()).filter((chain) => chain.status === "running" || chain.status === "failed");
 }
 
+export function clearFinishedWidgetRuns(
+	jobs: Map<string, JobMetadata> = liveJobs,
+	chains: Map<string, ChainRunMetadata> = liveChains,
+): { jobs: number; chains: number; total: number } {
+	let clearedJobs = 0;
+	let clearedChains = 0;
+	for (const [id, job] of jobs) {
+		if (job.status === "queued" || job.status === "running" || job.status === "paused") continue;
+		jobs.delete(id);
+		clearedJobs++;
+	}
+	for (const [id, chain] of chains) {
+		if (chain.status === "running") continue;
+		chains.delete(id);
+		clearedChains++;
+	}
+	return { jobs: clearedJobs, chains: clearedChains, total: clearedJobs + clearedChains };
+}
+
 function hasActiveWidgetItems(): boolean {
 	return activeWidgetJobs().length > 0 || activeWidgetChains().length > 0;
 }
@@ -831,6 +850,7 @@ export function buildAsyncWidgetSection(jobs: JobMetadata[], chains: ChainRunMet
 	for (const chain of chains.slice(0, 2)) lines.push(...renderChainWidgetLines(chain, now, chainWidgetExpanded));
 	const hidden = Math.max(0, jobs.length - 3) + Math.max(0, chains.length - 2);
 	if (hidden > 0) lines.push(`  +${hidden} more`);
+	if (failedJobs || failedChains) lines.push("  /subagents-clear to clear finished");
 	return { lines, summary, active: Boolean(runningJobs || runningChains || queued) };
 }
 
@@ -1387,6 +1407,16 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 			await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
 			await fs.promises.writeFile(outputPath, params.content, "utf-8");
 			return { content: [{ type: "text", text: `chain output saved: ${filename}` }], details: { filename, outputPath } };
+		},
+	});
+
+	pi.registerCommand("subagents-clear", {
+		description: "Clear finished async agents and chains from the status widget",
+		handler: async (_args, ctx) => {
+			lastUiContext = ctx;
+			const cleared = clearFinishedWidgetRuns();
+			renderAsyncWidget(ctx);
+			ctx.ui.notify(cleared.total === 0 ? "No finished async runs to clear." : `Cleared ${cleared.total} finished async run${cleared.total === 1 ? "" : "s"}.`, "info");
 		},
 	});
 

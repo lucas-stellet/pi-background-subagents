@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { buildAsyncWidgetSection, formatAgentDuration, formatElapsedMinutes } from "../index.ts";
+import { buildAsyncWidgetSection, clearFinishedWidgetRuns, formatAgentDuration, formatElapsedMinutes } from "../index.ts";
 
 function runningChain(startedAt: string, id = "chain-1") {
 	return {
@@ -48,6 +48,28 @@ test("shows and updates elapsed time after a single running chain", () => {
 	assert.equal(atFourMinutes.lines[0], "◆ Async agents · 1 chain running · 4m elapsed");
 });
 
+test("clears only finished jobs and chains from the widget state", () => {
+	const jobs = new Map([
+		["queued", { status: "queued" }],
+		["running", { status: "running" }],
+		["paused", { status: "paused" }],
+		["complete", { status: "complete" }],
+		["failed", { status: "failed" }],
+		["cancelled", { status: "cancelled" }],
+	]);
+	const chains = new Map([
+		["running", { status: "running" }],
+		["complete", { status: "complete" }],
+		["failed", { status: "failed" }],
+	]);
+
+	const cleared = clearFinishedWidgetRuns(jobs as never, chains as never);
+
+	assert.deepEqual(cleared, { jobs: 3, chains: 2, total: 5 });
+	assert.deepEqual([...jobs.keys()], ["queued", "running", "paused"]);
+	assert.deepEqual([...chains.keys()], ["running"]);
+});
+
 test("freezes a failed agent duration at finishedAt", () => {
 	const startedAt = "2026-07-09T12:00:00.000Z";
 	const job = {
@@ -71,6 +93,7 @@ test("freezes a failed agent duration at finishedAt", () => {
 	const section = buildAsyncWidgetSection([job], [], Date.parse(startedAt) + 3_600_000);
 
 	assert.match(section.lines[1]!, /reviewer · failed · model unknown · 1m · Failed/);
+	assert.equal(section.lines.at(-1), "  /subagents-clear to clear finished");
 });
 
 test("freezes a completed chain phase duration at finishedAt", () => {

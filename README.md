@@ -41,6 +41,7 @@ Implemented:
   - `list-agents`
   - `cancel`
 - Shows a compact async status widget inspired by `nicobailon/pi-subagents`.
+- Provides `/subagents-clear` to dismiss completed, failed, or cancelled runs from the widget without deleting their saved artifacts.
 - Shows provider/model metadata in start, status, list, finish, and widget output when available.
 - Respects prompt/context frontmatter:
   - `systemPromptMode: replace` uses `--system-prompt` so the child does not inherit Pi's default system prompt.

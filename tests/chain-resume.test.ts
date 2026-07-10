@@ -249,6 +249,7 @@ test("public chain resume honors a persistent controller lock held by another ru
 	const tools = new Map<string, any>();
 	const pi = {
 		registerTool(tool: { name: string }) { tools.set(tool.name, tool); },
+		registerCommand() {},
 		on() {},
 		async sendUserMessage() {},
 	} as unknown as ExtensionAPI;
