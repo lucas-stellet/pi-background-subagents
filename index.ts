@@ -345,6 +345,12 @@ function formatDuration(ms: number): string {
 	return `${Math.floor(ms / 3_600_000)}h ${Math.floor((ms % 3_600_000) / 60_000)}m`;
 }
 
+export function formatElapsedMinutes(ms: number): string {
+	const minutes = Math.floor(Math.max(0, ms) / 60_000);
+	if (minutes < 60) return `${minutes}m`;
+	return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+}
+
 function formatTokens(count: number): string {
 	if (count < 1000) return String(count);
 	if (count < 10_000) return `${(count / 1000).toFixed(1)}k`;
@@ -764,7 +770,7 @@ function renderChainWidgetLines(chain: ChainRunMetadata, now = Date.now(), expan
 	return lines;
 }
 
-function buildAsyncWidgetSection(jobs: JobMetadata[], chains: ChainRunMetadata[], now = Date.now()): { lines: string[]; summary: string; active: boolean } {
+export function buildAsyncWidgetSection(jobs: JobMetadata[], chains: ChainRunMetadata[], now = Date.now()): { lines: string[]; summary: string; active: boolean } {
 	const runningJobs = jobs.filter((job) => job.status === "running").length;
 	const queued = jobs.filter((job) => job.status === "queued").length;
 	const failedJobs = jobs.filter((job) => job.status === "failed").length;
@@ -772,7 +778,13 @@ function buildAsyncWidgetSection(jobs: JobMetadata[], chains: ChainRunMetadata[]
 	const failedChains = chains.filter((chain) => chain.status === "failed").length;
 	const parts: string[] = [];
 	if (runningJobs) parts.push(runningJobs === 1 ? "1 agent running" : `${runningJobs} agents running`);
-	if (runningChains) parts.push(runningChains === 1 ? "1 chain running" : `${runningChains} chains running`);
+	if (runningChains === 1) {
+		const chain = chains.find((item) => item.status === "running")!;
+		const elapsed = formatElapsedMinutes(now - Date.parse(chain.startedAt));
+		parts.push(`1 chain running · ${elapsed} elapsed`);
+	} else if (runningChains > 1) {
+		parts.push(`${runningChains} chains running`);
+	}
 	if (queued) parts.push(`${queued} queued`);
 	if (failedJobs) parts.push(`${failedJobs} agents failed`);
 	if (failedChains) parts.push(`${failedChains} chains failed`);
