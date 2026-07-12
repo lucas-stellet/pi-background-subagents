@@ -2,7 +2,7 @@
 
 A minimal Pi extension for running delegated subagents in the background.
 
-This project started from Pi's official `examples/extensions/subagent` example and keeps the same Markdown agent format, but changes the execution model: every subagent is started asynchronously, writes artifacts to the OS temp directory, and notifies the parent Pi session when it finishes.
+This project started from Pi's official `examples/extensions/subagent` example and keeps the same Markdown agent format, but changes the execution model: every subagent is started asynchronously, writes private persistent artifacts, and notifies the parent Pi session when it finishes.
 
 ## Current status
 
@@ -16,7 +16,13 @@ Implemented:
 - Persists job artifacts under:
 
   ```text
-  os.tmpdir()/pi-subagents/<parent-session-id>/<job-id>/
+  ~/.local/state/pi-background-subagents/subagents/<parent-session-id>/<job-id>/
+  ```
+
+- Persists chain artifacts under:
+
+  ```text
+  ~/.local/state/pi-background-subagents/chains/<parent-session-id>/<chain-id>/
   ```
 
 - Writes these artifacts per job:
@@ -24,7 +30,7 @@ Implemented:
   ```text
   task.json
   status.json
-  stdout.jsonl
+  stdout.jsonl (newest event segment; up to five 2 MiB segments are retained)
   stderr.log
   messages.json
   result.md
@@ -42,6 +48,7 @@ Implemented:
   - `cancel`
 - Shows a compact async status widget inspired by `nicobailon/pi-subagents`.
 - Provides `/subagents-clear` to dismiss completed, failed, or cancelled runs from the widget without deleting their saved artifacts.
+- Ignores transient `message_update` events in stdout artifacts. Artifacts are kept for manual cleanup only; the extension warns (without deleting data) when combined subagent and chain artifacts exceed 50 GiB under `~/.local/state/pi-background-subagents`.
 - Shows provider/model metadata in start, status, list, finish, and widget output when available.
 - Respects prompt/context frontmatter:
   - `systemPromptMode: replace` uses `--system-prompt` so the child does not inherit Pi's default system prompt.
@@ -318,7 +325,6 @@ Planned improvements:
 - Add richer TUI rendering for `renderCall` and `renderResult`.
 - Track recent tool calls and recent output snippets in status files.
 - Add stale-process reconciliation after parent Pi restarts.
-- Add job retention/cleanup policy for temp artifacts.
 - Add optional project-local builtin agents.
 - Add tests for agent discovery, status formatting, and job lifecycle.
 - Publish as an npm Pi package.

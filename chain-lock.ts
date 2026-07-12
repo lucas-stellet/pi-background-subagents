@@ -85,7 +85,7 @@ export function tryAcquireChainControllerLock(
 
 	for (;;) {
 		const candidateDir = join(chainDir, `${lockDirectoryName}.candidate-${randomUUID()}`);
-		mkdirSync(candidateDir);
+		mkdirSync(candidateDir, { mode: 0o700 });
 		try {
 			const now = Date.now();
 			writeFileSync(join(candidateDir, ownerFileName), JSON.stringify({
@@ -93,7 +93,7 @@ export function tryAcquireChainControllerLock(
 				processStartTime: getProcessStartTime(owner.pid),
 				acquiredAt: now,
 				updatedAt: now,
-			} satisfies ChainControllerLockOwner));
+			} satisfies ChainControllerLockOwner), { mode: 0o600 });
 		} catch (error) {
 			rmSync(candidateDir, { recursive: true, force: true });
 			throw error;

@@ -3,7 +3,7 @@
  *
  * Differences from the official example:
  * - every subagent runs in the background;
- * - job artifacts are persisted under os.tmpdir()/pi-subagents/<main-session-id>/<job-id>;
+ * - job and chain artifacts are persisted privately under ~/.local/state/pi-background-subagents;
  * - when a child process exits, the main agent is notified via pi.sendUserMessage()
  *   so it can inspect and validate the result.
  */
@@ -11,7 +11,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -34,14 +33,21 @@ import {
 	resolveChainScopeForResume,
 } from "./chain-resume.ts";
 import { type ChainConfig, type ChainMode, type ChainPhase, type ChainScope, discoverChains } from "./chains.ts";
+import {
+	createArtifactUsageWarningCoordinator,
+	createRollingEventWriter,
+	ensurePrivateDirectory,
+	ensurePrivateFile,
+	measureArtifactUsage,
+	resolveArtifactRoots,
+	withDiskPressureContainment,
+} from "./job-storage.ts";
 import { prepareSubagentIntercom } from "./intercom.ts";
 
 const CUSTOM_TYPE = "background-subagents";
-const JOBS_ROOT_NAME = "pi-subagents";
 const RESULT_PREVIEW_CHARS = 20_000;
 const WIDGET_KEY = "pi-subagents";
 const LEGACY_WIDGET_KEY = "subagent-async";
-const CHAIN_JOBS_ROOT_NAME = "pi-chains";
 const READ_TRUNCATE_LINES = 2000;
 const READ_TRUNCATE_BYTES = 50_000;
 const CTRL_O = "\x0f";
@@ -183,6 +189,7 @@ const chainControllerOwner = { runtimeId: randomUUID(), pid: process.pid };
 let lastUiContext: ExtensionContext | null = null;
 let widgetRefreshTimer: ReturnType<typeof setInterval> | null = null;
 let chainWidgetExpanded = false;
+let artifactRoots = resolveArtifactRoots();
 
 function emptyUsage(): UsageStats {
 	return { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 };
@@ -205,11 +212,11 @@ function getSupervisorTarget(ctx: ExtensionContext): string | undefined {
 }
 
 function getBaseDir(sessionId: string): string {
-	return path.join(os.tmpdir(), JOBS_ROOT_NAME, sessionId);
+	return path.join(artifactRoots.subagentsDir, sessionId);
 }
 
 function getChainBaseDir(sessionId: string): string {
-	return path.join(os.tmpdir(), CHAIN_JOBS_ROOT_NAME, sessionId);
+	return path.join(artifactRoots.chainsDir, sessionId);
 }
 
 function chainStatusPath(chainDir: string): string {
@@ -246,10 +253,19 @@ function statusPath(jobDir: string): string {
 }
 
 async function writeJson(filePath: string, value: unknown): Promise<void> {
-	await fs.promises.mkdir(path.dirname(filePath), { recursive: true });
+	await ensurePrivateDirectory(path.dirname(filePath));
 	await withFileMutationQueue(filePath, async () => {
-		await fs.promises.writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf-8");
+		await fs.promises.writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, { encoding: "utf-8", mode: 0o600 });
+		await ensurePrivateFile(filePath);
 	});
+}
+
+async function containRuntimeArtifactWrite(operation: () => Promise<unknown>): Promise<void> {
+	try {
+		await withDiskPressureContainment(operation);
+	} catch (error) {
+		console.error("Background subagent artifact write failed:", error);
+	}
 }
 
 function readJson<T>(filePath: string): T | null {
@@ -280,12 +296,13 @@ function readProcessCommand(pid: number | undefined): string | undefined {
 	}
 }
 
-async function writePromptToTempFile(jobDir: string, agentName: string, prompt: string): Promise<string | null> {
+async function writePromptFile(jobDir: string, agentName: string, prompt: string): Promise<string | null> {
 	if (!prompt.trim()) return null;
 	const promptPath = path.join(jobDir, `system-prompt-${safeName(agentName)}.md`);
 	await writeJson(path.join(jobDir, "prompt-meta.json"), { promptPath });
 	await withFileMutationQueue(promptPath, async () => {
 		await fs.promises.writeFile(promptPath, prompt, { encoding: "utf-8", mode: 0o600 });
+		await ensurePrivateFile(promptPath);
 	});
 	return promptPath;
 }
@@ -896,10 +913,13 @@ async function startJob(
 ): Promise<JobMetadata> {
 	const options: StartJobOptions = typeof cwdOrOptions === "string" ? { cwd: cwdOrOptions } : (cwdOrOptions ?? {});
 	const sessionId = options.sessionId ?? getSessionId(ctx);
+	await ensurePrivateDirectory(artifactRoots.baseDir);
+	await ensurePrivateDirectory(artifactRoots.subagentsDir);
 	const baseDir = getBaseDir(sessionId);
+	await ensurePrivateDirectory(baseDir);
 	const jobId = `subagent-${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}-${randomUUID().slice(0, 8)}`;
 	const jobDir = path.join(baseDir, jobId);
-	await fs.promises.mkdir(jobDir, { recursive: true });
+	await ensurePrivateDirectory(jobDir);
 
 	const now = Date.now();
 	const initialModel = options.model
@@ -956,7 +976,7 @@ async function startJob(
 
 	const promptParts = [intercomBridge?.instruction, options.promptPrefix, agent.systemPrompt].filter((part): part is string => Boolean(part));
 	const systemPrompt = promptParts.join("\n\n");
-	const promptPath = await writePromptToTempFile(jobDir, agent.name, systemPrompt);
+	const promptPath = await writePromptFile(jobDir, agent.name, systemPrompt);
 	if (promptPath) args.push(agent.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt", promptPath);
 	args.push(`Task: ${task}`);
 
@@ -973,7 +993,7 @@ async function startJob(
 	if (!options.skipWidget) liveJobs.set(jobId, job);
 	if (!options.skipWidget) renderAsyncWidget(ctx);
 
-	const stdoutPath = path.join(jobDir, "stdout.jsonl");
+	const stdoutWriter = createRollingEventWriter(jobDir);
 	const stderrPath = path.join(jobDir, "stderr.log");
 	const messagesPath = path.join(jobDir, "messages.json");
 	const resultPath = path.join(jobDir, "result.md");
@@ -985,13 +1005,15 @@ async function startJob(
 
 	const processLine = async (line: string) => {
 		if (!line.trim()) return;
-		await fs.promises.appendFile(stdoutPath, `${line}\n`, "utf-8");
 		let event: any;
 		try {
 			event = JSON.parse(line);
 		} catch {
 			return;
 		}
+		// Skip persistence and semantic handling for transient streaming updates.
+		if (event.type === "message_update") return;
+		await containRuntimeArtifactWrite(() => stdoutWriter.appendLine(line));
 
 		if (event.type === "tool_execution_start") {
 			job.currentTool = event.toolName;
@@ -999,7 +1021,7 @@ async function startJob(
 			job.currentToolStartedAt = Date.now();
 			job.lastUpdate = job.currentToolStartedAt;
 			job.lastActivityAt = job.currentToolStartedAt;
-			await writeJson(statusPath(jobDir), job);
+			await containRuntimeArtifactWrite(() => writeJson(statusPath(jobDir), job));
 			if (!options.skipWidget) renderAsyncWidget();
 		}
 
@@ -1010,7 +1032,7 @@ async function startJob(
 			job.currentToolStartedAt = undefined;
 			job.lastUpdate = Date.now();
 			job.lastActivityAt = job.lastUpdate;
-			await writeJson(statusPath(jobDir), job);
+			await containRuntimeArtifactWrite(() => writeJson(statusPath(jobDir), job));
 			if (!options.skipWidget) renderAsyncWidget();
 		}
 
@@ -1018,41 +1040,58 @@ async function startJob(
 			const message = event.message as Message;
 			messages.push(message);
 			updateUsageFromMessage(job, message);
-			await writeJson(messagesPath, messages);
-			await writeJson(statusPath(jobDir), job);
+			await containRuntimeArtifactWrite(() => writeJson(messagesPath, messages));
+			await containRuntimeArtifactWrite(() => writeJson(statusPath(jobDir), job));
 			if (!options.skipWidget) renderAsyncWidget();
 		}
+	};
+
+	// Keep serializing stdout lines even if an earlier line rejected unexpectedly.
+	const enqueueStdoutLine = (line: string) => {
+		lineProcessing = lineProcessing.then(
+			() => processLine(line),
+			(error) => {
+				console.error("Background subagent stdout processing failed:", error);
+				return processLine(line);
+			},
+		);
 	};
 
 	proc.stdout.on("data", (data) => {
 		stdoutBuffer += data.toString();
 		const lines = stdoutBuffer.split("\n");
 		stdoutBuffer = lines.pop() || "";
-		for (const line of lines) lineProcessing = lineProcessing.then(() => processLine(line));
+		for (const line of lines) enqueueStdoutLine(line);
 	});
 
 	proc.stderr.on("data", (data) => {
 		const text = data.toString();
 		stderr += text;
-		void fs.promises.appendFile(stderrPath, text, "utf-8");
+		void containRuntimeArtifactWrite(async () => {
+			await fs.promises.appendFile(stderrPath, text, { encoding: "utf-8", mode: 0o600 });
+			await ensurePrivateFile(stderrPath);
+		});
 	});
 
-	proc.on("error", async (error) => {
+	proc.on("error", (error) => {
 		job.status = "failed";
 		job.errorMessage = error.message;
 		job.finishedAt = new Date().toISOString();
-		await writeJson(statusPath(jobDir), job);
+		void containRuntimeArtifactWrite(() => writeJson(statusPath(jobDir), job));
 	});
 
-	proc.on("close", async (code, signal) => {
+	const handleClose = async (code: number | null, signal: NodeJS.Signals | null) => {
 		runningJobs.delete(jobId);
 		const wasCancelled = cancelledJobs.delete(jobId);
-		if (stdoutBuffer.trim()) lineProcessing = lineProcessing.then(() => processLine(stdoutBuffer));
-		await lineProcessing;
+		if (stdoutBuffer.trim()) enqueueStdoutLine(stdoutBuffer);
+		await lineProcessing.catch((error) => console.error("Background subagent stdout processing failed:", error));
 
 		const finalOutput = getFinalOutput(messages);
-		await fs.promises.writeFile(resultPath, finalOutput || "(no output)\n", "utf-8");
-		await writeJson(messagesPath, messages);
+		await containRuntimeArtifactWrite(async () => {
+			await fs.promises.writeFile(resultPath, finalOutput || "(no output)\n", { encoding: "utf-8", mode: 0o600 });
+			await ensurePrivateFile(resultPath);
+		});
+		await containRuntimeArtifactWrite(() => writeJson(messagesPath, messages));
 
 		job.exitCode = code;
 		job.finishedAt = new Date().toISOString();
@@ -1065,7 +1104,7 @@ async function startJob(
 		else if ((job.exitCode ?? 0) !== 0 || job.stopReason === "error" || job.stopReason === "aborted") job.status = "failed";
 		else job.status = "complete";
 		if (!job.errorMessage && stderr.trim() && job.status === "failed") job.errorMessage = stderr.trim().slice(0, 4000);
-		await writeJson(statusPath(jobDir), job);
+		await containRuntimeArtifactWrite(() => writeJson(statusPath(jobDir), job));
 		if (job.status === "complete" || job.status === "cancelled") liveJobs.delete(jobId);
 		if (!options.skipWidget) {
 			renderAsyncWidget();
@@ -1097,6 +1136,12 @@ async function startJob(
 		} catch {
 			// The parent runtime may have been shut down/reloaded; artifacts are still on disk.
 		}
+	};
+
+	proc.on("close", (code, signal) => {
+		void handleClose(code, signal).catch((error) => {
+			console.error("Background subagent close handling failed:", error);
+		});
 	});
 
 	return job;
@@ -1190,7 +1235,7 @@ async function runChainPhase(pi: ExtensionAPI, ctx: ExtensionContext, chainRun: 
 	phaseRun.status = "running";
 	const attemptNo = phaseRun.attempts.length + 1;
 	const attemptDir = path.join(chainRun.chainDir, "phases", safeName(phaseRun.phaseId), `attempt-${attemptNo}`);
-	await fs.promises.mkdir(attemptDir, { recursive: true });
+	await ensurePrivateDirectory(attemptDir);
 	const phaseContext: ChainPhaseContext = {
 		chainId: chainRun.id,
 		chainDir: chainRun.chainDir,
@@ -1261,8 +1306,9 @@ async function runChainPhase(pi: ExtensionAPI, ctx: ExtensionContext, chainRun: 
 		}
 		for (const file of produced) {
 			const outputPath = path.join(chainOutputsDir(chainRun.chainDir), file);
-			await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
+			await ensurePrivateDirectory(path.dirname(outputPath));
 			await fs.promises.copyFile(chainAttemptOutputPath(attemptDir, file), outputPath);
+			await ensurePrivateFile(outputPath);
 		}
 		attempt.status = "complete";
 		phaseRun.status = "complete";
@@ -1359,7 +1405,17 @@ export default function (pi: ExtensionAPI) {
 	registerBackgroundSubagentTool(pi);
 }
 
-export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
+export function registerBackgroundSubagentTool(pi: ExtensionAPI, options: { storageHome?: string } = {}) {
+	artifactRoots = resolveArtifactRoots({ home: options.storageHome });
+	const usageWarning = createArtifactUsageWarningCoordinator({
+		measure: () => measureArtifactUsage(artifactRoots),
+		notify: (message) => {
+			if (!lastUiContext?.hasUI) throw new Error("UI unavailable");
+			lastUiContext.ui.notify(message, "warning");
+		},
+		warn: (message) => console.warn(message),
+		manualCleanupPath: artifactRoots.baseDir,
+	});
 	pi.registerTool({
 		name: "chain_read",
 		label: "chain_read",
@@ -1404,8 +1460,9 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 			if (!phaseContext.allowedOutputs.includes(filename)) return { content: [{ type: "text", text: `Output not allowed by this phase: ${filename}` }], isError: true, details };
 			const outputPath = chainAttemptOutputPath(phaseContext.attemptDir, filename);
 			details = { filename, outputPath };
-			await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
-			await fs.promises.writeFile(outputPath, params.content, "utf-8");
+			await ensurePrivateDirectory(path.dirname(outputPath));
+			await fs.promises.writeFile(outputPath, params.content, { encoding: "utf-8", mode: 0o600 });
+			await ensurePrivateFile(outputPath);
 			return { content: [{ type: "text", text: `chain output saved: ${filename}` }], details: { filename, outputPath } };
 		},
 	});
@@ -1422,6 +1479,7 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		lastUiContext = ctx;
+		void usageWarning.check().catch(() => undefined);
 		try { ctx.ui.setWidget(LEGACY_WIDGET_KEY, undefined); } catch { /* ignore stale legacy widget */ }
 		if (ctx.mode === "tui") {
 			ctx.ui.onTerminalInput((data) => {
@@ -1551,15 +1609,18 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 			const discovery = discoverChains(chainCwd, chainScope);
 			const chain = discovery.chains.find((c) => c.name === params.chain);
 			if (!chain) return { content: [{ type: "text", text: `Unknown chain: ${params.chain}` }], isError: true, details: { sessionId, baseDir, chains: discovery.chains } };
+			await ensurePrivateDirectory(artifactRoots.baseDir);
+			await ensurePrivateDirectory(artifactRoots.chainsDir);
 			const chainId = `chain-${new Date().toISOString().replace(/[-:.TZ]/g, "").slice(0, 14)}-${randomUUID().slice(0, 8)}`;
+			await ensurePrivateDirectory(baseDir);
 			const chainDir = path.join(baseDir, chainId);
-			await fs.promises.mkdir(chainDir, { recursive: true });
+			await ensurePrivateDirectory(chainDir);
 			if (!tryAcquireChainControllerLock(chainDir, chainControllerOwner)) {
 				return { content: [{ type: "text", text: `Controller lock is held for chain ${chainId}; it cannot be started.` }], isError: true, details: { sessionId, baseDir, code: "controller_lock_held" } };
 			}
 			let chainRun: ChainRunMetadata;
 			try {
-				await fs.promises.mkdir(chainOutputsDir(chainDir), { recursive: true });
+				await ensurePrivateDirectory(chainOutputsDir(chainDir));
 				chainRun = {
 					id: chainId,
 					sessionId,
@@ -1624,7 +1685,7 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI) {
 		label: "Subagent",
 		description: [
 			"Start and manage background subagents with isolated context.",
-			"All subagents run in background and save artifacts under the OS temp directory.",
+			"All subagents run in background and save private persistent artifacts under ~/.local/state/pi-background-subagents/subagents.",
 			"Actions: start, status, result, list, list-agents, cancel.",
 			"Agent frontmatter controls prompt isolation: systemPromptMode=replace uses --system-prompt and does not include Pi's default system prompt; systemPromptMode=append uses --append-system-prompt.",
 			"inheritProjectContext=false passes --no-context-files; inheritSkills=false passes --no-skills.",

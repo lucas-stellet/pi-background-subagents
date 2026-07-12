@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -108,6 +108,16 @@ test("recovers from a corrupt canonical controller lock", (t) => {
 	});
 
 	assert.equal(acquired, true);
+});
+
+test("creates private controller lock artifacts", (t) => {
+	if (process.platform === "win32") return;
+	const chainDir = mkdtempSync(join(tmpdir(), "chain-lock-test-"));
+	t.after(() => rmSync(chainDir, { recursive: true, force: true }));
+
+	assert.equal(tryAcquireChainControllerLock(chainDir, { runtimeId: "runtime-1", pid: process.pid }), true);
+	assert.equal(statSync(join(chainDir, ".controller-lock")).mode & 0o777, 0o700);
+	assert.equal(statSync(join(chainDir, ".controller-lock", "owner.json")).mode & 0o777, 0o600);
 });
 
 test("allows a different live runtime to acquire after the owner releases", (t) => {

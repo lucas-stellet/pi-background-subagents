@@ -190,15 +190,16 @@ test("resume rejects a chain whose persisted definition identity no longer match
 
 test("public chain resume honors a persistent controller lock held by another runtime", async (t) => {
 	const projectDir = mkdtempSync(join(tmpdir(), "chain-resume-project-"));
+	const storageHome = mkdtempSync(join(tmpdir(), "chain-resume-home-"));
 	const sessionId = `chain-resume-session-${process.pid}-${Date.now()}`;
 	const chainId = "locked-chain";
-	const chainDir = join(tmpdir(), "pi-chains", sessionId, chainId);
+	const chainDir = join(storageHome, ".local", "state", "pi-background-subagents", "chains", sessionId, chainId);
 	const chainFile = join(projectDir, ".pi", "chains", "locked.chain.yaml");
 	const lockOwner = { runtimeId: "external-runtime", pid: process.pid };
 	t.after(() => {
 		chainLock.releaseChainControllerLock(chainDir, lockOwner);
 		rmSync(projectDir, { recursive: true, force: true });
-		rmSync(join(tmpdir(), "pi-chains", sessionId), { recursive: true, force: true });
+		rmSync(storageHome, { recursive: true, force: true });
 	});
 
 	mkdirSync(join(projectDir, ".pi", "chains"), { recursive: true });
@@ -253,7 +254,7 @@ test("public chain resume honors a persistent controller lock held by another ru
 		on() {},
 		async sendUserMessage() {},
 	} as unknown as ExtensionAPI;
-	registerBackgroundSubagentTool(pi);
+	registerBackgroundSubagentTool(pi, { storageHome });
 	const ctx = {
 		cwd: projectDir,
 		hasUI: false,
