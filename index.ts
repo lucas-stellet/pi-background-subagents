@@ -1394,9 +1394,6 @@ const SubagentParams = Type.Object({
 	task: Type.Optional(Type.String({ description: "Task to delegate (start action). The selected agent's frontmatter controls whether its prompt replaces or appends to Pi's default prompt." })),
 	jobId: Type.Optional(Type.String({ description: "Background job id (status/result/cancel actions). Status output includes the prompt mode used for the run." })),
 	agentScope: Type.Optional(AgentScopeSchema),
-	confirmProjectAgents: Type.Optional(
-		Type.Boolean({ description: "Prompt before running project-local agents. Default: false.", default: false }),
-	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the subagent process" })),
 	verbose: Type.Optional(Type.Boolean({ description: "Include debug paths and full artifact details in status/list output. Default: false.", default: false })),
 });
@@ -1802,16 +1799,6 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI, options: { stor
 					details: { sessionId, baseDir },
 					isError: true,
 				};
-			}
-
-			if (agent.source === "project" && (params.confirmProjectAgents ?? false) && ctx.hasUI) {
-				const ok = await ctx.ui.confirm(
-					"Run project-local subagent?",
-					`Agent: ${agent.name}\nSource: ${agent.filePath}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
-				);
-				if (!ok) {
-					return { content: [{ type: "text", text: "Canceled: project-local agent not approved." }], details: { sessionId, baseDir } };
-				}
 			}
 
 			const job = await startJob(pi, ctx, agent, params.task, params.cwd);

@@ -276,16 +276,6 @@ Chain outputs are stored under the chain run artifacts directory and must be dec
 
 `chain status` first reports the current runtime/process check, then the persisted `status.json` state. If `status.json` says a chain is `running` but no controller or phase process is found, the chain is not executing now; the displayed status is only the last persisted state before the parent runtime stopped.
 
-## Project-local agent confirmation
-
-Project-local agents run without an interactive confirmation by default. To opt back into the trust prompt for a specific call, pass:
-
-```json
-{
-  "confirmProjectAgents": true
-}
-```
-
 ## Supervisor coordination
 
 Install `pi-intercom` globally and reload Pi:
