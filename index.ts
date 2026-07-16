@@ -11,6 +11,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
 import { StringEnum } from "@earendil-works/pi-ai";
@@ -891,6 +892,14 @@ function toggleChainWidgetExpanded(ctx: ExtensionContext): void {
 	renderAsyncWidget(ctx);
 }
 
+function resolveSubagentCwd(receivedCwd: string, baseCwd: string): { cwd?: string; error?: string } {
+	if (receivedCwd === "~") return { cwd: os.homedir() };
+	if (receivedCwd.startsWith("~/")) return { cwd: path.resolve(os.homedir(), receivedCwd.slice(2)) };
+	if (receivedCwd.startsWith("~")) return { error: "Named-user home paths are unsupported. Use ~, ~/..., or an absolute path." };
+	if (path.isAbsolute(receivedCwd)) return { cwd: receivedCwd };
+	return { cwd: path.resolve(baseCwd, receivedCwd) };
+}
+
 interface StartJobOptions {
 	cwd?: string;
 	tools?: string[];
@@ -981,17 +990,6 @@ async function startJob(
 	args.push(`Task: ${task}`);
 
 	const invocation = getPiInvocation(args);
-	const proc = spawn(invocation.command, invocation.args, {
-		cwd: job.cwd,
-		shell: false,
-		stdio: ["ignore", "pipe", "pipe"],
-		env: { ...process.env, ...(options.env ?? {}), ...(intercomBridge?.env ?? {}) },
-	});
-	job.pid = proc.pid;
-	await writeJson(statusPath(jobDir), job);
-	runningJobs.set(jobId, proc);
-	if (!options.skipWidget) liveJobs.set(jobId, job);
-	if (!options.skipWidget) renderAsyncWidget(ctx);
 
 	const stdoutWriter = createRollingEventWriter(jobDir);
 	const stderrPath = path.join(jobDir, "stderr.log");
@@ -1057,29 +1055,6 @@ async function startJob(
 		);
 	};
 
-	proc.stdout.on("data", (data) => {
-		stdoutBuffer += data.toString();
-		const lines = stdoutBuffer.split("\n");
-		stdoutBuffer = lines.pop() || "";
-		for (const line of lines) enqueueStdoutLine(line);
-	});
-
-	proc.stderr.on("data", (data) => {
-		const text = data.toString();
-		stderr += text;
-		void containRuntimeArtifactWrite(async () => {
-			await fs.promises.appendFile(stderrPath, text, { encoding: "utf-8", mode: 0o600 });
-			await ensurePrivateFile(stderrPath);
-		});
-	});
-
-	proc.on("error", (error) => {
-		job.status = "failed";
-		job.errorMessage = error.message;
-		job.finishedAt = new Date().toISOString();
-		void containRuntimeArtifactWrite(() => writeJson(statusPath(jobDir), job));
-	});
-
 	const handleClose = async (code: number | null, signal: NodeJS.Signals | null) => {
 		runningJobs.delete(jobId);
 		const wasCancelled = cancelledJobs.delete(jobId);
@@ -1099,10 +1074,13 @@ async function startJob(
 		job.currentTool = undefined;
 		job.currentToolArgs = undefined;
 		job.currentToolStartedAt = undefined;
-		if (wasCancelled) job.status = "cancelled";
-		else if (signal) job.status = "failed";
-		else if ((job.exitCode ?? 0) !== 0 || job.stopReason === "error" || job.stopReason === "aborted") job.status = "failed";
-		else job.status = "complete";
+		// Preserve a launch failure if close follows the error event.
+		if (job.status !== "failed") {
+			if (wasCancelled) job.status = "cancelled";
+			else if (signal) job.status = "failed";
+			else if ((job.exitCode ?? 0) !== 0 || job.stopReason === "error" || job.stopReason === "aborted") job.status = "failed";
+			else job.status = "complete";
+		}
 		if (!job.errorMessage && stderr.trim() && job.status === "failed") job.errorMessage = stderr.trim().slice(0, 4000);
 		await containRuntimeArtifactWrite(() => writeJson(statusPath(jobDir), job));
 		if (job.status === "complete" || job.status === "cancelled") liveJobs.delete(jobId);
@@ -1138,13 +1116,85 @@ async function startJob(
 		}
 	};
 
-	proc.on("close", (code, signal) => {
-		void handleClose(code, signal).catch((error) => {
-			console.error("Background subagent close handling failed:", error);
-		});
+	let launchSettled = false;
+	let resolveLaunch!: (job: JobMetadata) => void;
+	const launchReady = new Promise<JobMetadata>((resolve) => {
+		resolveLaunch = resolve;
 	});
+	const failLaunch = async (error: Error) => {
+		if (launchSettled) return;
+		launchSettled = true;
+		job.status = "failed";
+		job.errorMessage = error.message;
+		job.finishedAt = new Date().toISOString();
+		runningJobs.delete(jobId);
+		try {
+			await writeJson(statusPath(jobDir), job);
+		} catch (writeError) {
+			console.error("Background subagent launch failure status write failed:", writeError);
+		} finally {
+			resolveLaunch(job);
+		}
+	};
+	const attachProcessListeners = (proc: ChildProcess) => {
+		proc.stdout?.on("data", (data) => {
+			stdoutBuffer += data.toString();
+			const lines = stdoutBuffer.split("\n");
+			stdoutBuffer = lines.pop() || "";
+			for (const line of lines) enqueueStdoutLine(line);
+		});
+		proc.stderr?.on("data", (data) => {
+			const text = data.toString();
+			stderr += text;
+			void containRuntimeArtifactWrite(async () => {
+				await fs.promises.appendFile(stderrPath, text, { encoding: "utf-8", mode: 0o600 });
+				await ensurePrivateFile(stderrPath);
+			});
+		});
+		proc.on("error", (error) => {
+			if (!launchSettled) {
+				void failLaunch(error);
+				return;
+			}
+			job.status = "failed";
+			job.errorMessage = error.message;
+			job.finishedAt = new Date().toISOString();
+			runningJobs.delete(jobId);
+			void containRuntimeArtifactWrite(() => writeJson(statusPath(jobDir), job));
+		});
+		proc.on("spawn", () => {
+			if (launchSettled) return;
+			launchSettled = true;
+			if (proc.pid !== undefined) job.pid = proc.pid;
+			runningJobs.set(jobId, proc);
+			if (!options.skipWidget) {
+				liveJobs.set(jobId, job);
+				renderAsyncWidget(ctx);
+			}
+			void writeJson(statusPath(jobDir), job).catch((error) => {
+				console.error("Background subagent launch status write failed:", error);
+			}).finally(() => resolveLaunch(job));
+		});
+		proc.on("close", (code, signal) => {
+			void handleClose(code, signal).catch((error) => {
+				console.error("Background subagent close handling failed:", error);
+			});
+		});
+	};
 
-	return job;
+	try {
+		const proc = spawn(invocation.command, invocation.args, {
+			cwd: job.cwd,
+			shell: false,
+			stdio: ["ignore", "pipe", "pipe"],
+			env: { ...process.env, ...(options.env ?? {}), ...(intercomBridge?.env ?? {}) },
+		});
+		attachProcessListeners(proc);
+	} catch (error) {
+		void failLaunch(error instanceof Error ? error : new Error(String(error)));
+	}
+
+	return await launchReady;
 }
 
 function phaseOutputs(phase: ChainPhase): string[] {
@@ -1801,7 +1851,41 @@ export function registerBackgroundSubagentTool(pi: ExtensionAPI, options: { stor
 				};
 			}
 
-			const job = await startJob(pi, ctx, agent, params.task, params.cwd);
+			const receivedCwd = params.cwd ?? ctx.cwd;
+			const cwdResolution = resolveSubagentCwd(receivedCwd, ctx.cwd);
+			if (cwdResolution.error || !cwdResolution.cwd) {
+				return {
+					content: [{ type: "text", text: `Cannot start subagent with cwd "${receivedCwd}": ${cwdResolution.error}` }],
+					details: { sessionId, baseDir, receivedCwd },
+					isError: true,
+				};
+			}
+			const resolvedCwd = cwdResolution.cwd;
+			try {
+				const cwdStat = await fs.promises.stat(resolvedCwd);
+				if (!cwdStat.isDirectory()) {
+					return {
+						content: [{ type: "text", text: `Cannot start subagent: cwd "${receivedCwd}" resolved to "${resolvedCwd}", which is not a directory. Use an existing directory or correct the path.` }],
+						details: { sessionId, baseDir, receivedCwd, resolvedCwd },
+						isError: true,
+					};
+				}
+			} catch {
+				return {
+					content: [{ type: "text", text: `Cannot start subagent: cwd "${receivedCwd}" resolved to "${resolvedCwd}", which does not exist. Use an existing directory or correct the path.` }],
+					details: { sessionId, baseDir, receivedCwd, resolvedCwd },
+					isError: true,
+				};
+			}
+
+			const job = await startJob(pi, ctx, agent, params.task, resolvedCwd);
+			if (job.status === "failed") {
+				return {
+					content: [{ type: "text", text: `Unable to launch subagent. Check the executable and working directory, then try again. ${job.errorMessage ?? ""}`.trim() }],
+					details: { sessionId, baseDir, job },
+					isError: true,
+				};
+			}
 			pi.appendEntry(CUSTOM_TYPE, { event: "started", job });
 			return {
 				content: [
